@@ -1,0 +1,2 @@
+Dummy demo file for Antigravity autonomous agent.
+This file is uploaded automatically when the agent clicks a button that opens a native file chooser.
