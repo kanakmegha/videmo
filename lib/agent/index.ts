@@ -91,9 +91,10 @@ async function launchContext(
       "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
       "--disable-infobars",
-      "--use-gl=swiftshader",       // software GL — prevents black/blank frames in headless
-      "--enable-webgl",
       "--hide-scrollbars",
+      // swiftshader (software GL) is needed on Linux/cloud to prevent black frames;
+      // on macOS it can cause white frames, so only apply it there
+      ...(process.platform === "linux" ? ["--use-gl=swiftshader", "--enable-webgl"] : []),
     ],
     ignoreDefaultArgs: ["--enable-automation"],
     userAgent:
@@ -187,6 +188,10 @@ export class DemoAgent {
       const page = ctx.pages()[0] ?? (await ctx.newPage());
 
       await this.emit("phase", { phase: "execute", message: "Recording demo…" });
+
+      // Always open the target URL first — guarantees the recording has real content
+      // even if the first plan step is somehow missing or the navigate fails later
+      await this._navigateTo(page, this.url);
 
       for (let i = 0; i < steps.length; i++) {
         const step = steps[i];
@@ -474,17 +479,34 @@ export class DemoAgent {
     return steps;
   }
 
+  // ── Navigate helper ───────────────────────────────────────────────────────
+  // Robust navigation: tries "load" (waits for JS to run), falls back to
+  // "domcontentloaded", then waits extra time for SPA rendering.
+
+  private async _navigateTo(page: Page, url: string): Promise<void> {
+    try {
+      await page.goto(url, { waitUntil: "load", timeout: 30_000 });
+    } catch {
+      // fallback if "load" times out (e.g. site keeps loading resources forever)
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      } catch {
+        // best-effort — page might still have content
+      }
+    }
+    // Wait for the body to have visible content (catches SPA hydration delay)
+    await page.waitForSelector("body:not(:empty)", { timeout: 8_000 }).catch(() => {});
+    // Extra pause so JS frameworks (React/Next.js) finish rendering
+    await sleep(3000);
+  }
+
   // ── Execute action ────────────────────────────────────────────────────────
 
   private async _performAction(page: Page, step: PlanStep): Promise<boolean> {
     try {
       switch (step.action) {
         case "navigate": {
-          await page.goto(step.url ?? this.url, {
-            waitUntil: "domcontentloaded",
-            timeout: 20_000,
-          });
-          await sleep(2000);
+          await this._navigateTo(page, step.url ?? this.url);
           break;
         }
 
