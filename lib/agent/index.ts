@@ -3,7 +3,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import OpenAI from "openai";
 import type { BrowserContext, Page } from "playwright-core";
-import type { PlanStep, PageInfo, PageCategory, ProductProfile } from "../types";
+import type {
+  PlanStep, PageInfo, PageCategory, ProductProfile,
+  TraceAction, ExplorationChain,
+} from "../types";
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -170,8 +173,10 @@ type Emit = (type: string, data: Record<string, unknown>) => void;
 const LOCAL_VIDEO_DIR = join(tmpdir(), "demogen-videos");
 
 export class DemoAgent {
-  private sitemap     = new Map<string, PageInfo>();
+  private sitemap        = new Map<string, PageInfo>();
   private profile: ProductProfile | null = null;
+  private globalTraceLog: ExplorationChain[] = [];
+  private scoutDeadline  = 0; // ms timestamp — abort scout when exceeded
 
   constructor(
     private jobId: string,
@@ -330,6 +335,168 @@ export class DemoAgent {
         await this.emit("discover_error", { url, error: String(e) });
       }
     }
+
+    // After static crawl, run Deep Chain Exploration on the homepage
+    await this._deepScoutRoot(page);
+  }
+
+  // ── Deep Chain Exploration ───────────────────────────────────────────────
+  // Recursively click interactive elements, detect state changes, score chains.
+  // Budget: 45s total, depth 3, breadth 4 per node — fits within plan-stream's
+  // 120s maxDuration alongside strategize + deep analyze.
+
+  private async _deepScoutRoot(page: Page) {
+    this.scoutDeadline = Date.now() + 45_000;
+    try {
+      await page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      await sleep(1500);
+      await this.emit("phase", { phase: "discover", message: "Deep-scouting interactive chains…" });
+      await this._deepScout(page, [], 0);
+      await this.emit("scout_complete", {
+        chains: this.globalTraceLog.length,
+        deepest: Math.max(0, ...this.globalTraceLog.map((c) => c.length)),
+      });
+    } catch (e) {
+      await this.emit("scout_error", { error: String(e) });
+    }
+  }
+
+  private async _snapshotState(page: Page): Promise<{ url: string; size: number; topZ: number }> {
+    const url = page.url();
+    const data = await page.evaluate(() => {
+      const size = (document.body?.innerHTML?.length ?? 0);
+      let topZ = 0;
+      document.querySelectorAll("*").forEach((el) => {
+        const z = parseInt(getComputedStyle(el).zIndex, 10);
+        if (Number.isFinite(z) && z > topZ) topZ = z;
+      });
+      return { size, topZ };
+    }).catch(() => ({ size: 0, topZ: 0 }));
+    return { url, ...data };
+  }
+
+  private _detectChange(
+    before: { url: string; size: number; topZ: number },
+    after:  { url: string; size: number; topZ: number }
+  ): { changed: TraceAction["state_change"]; delta: number } {
+    if (before.url !== after.url) return { changed: "url", delta: 0 };
+    if (after.topZ > before.topZ + 100 && after.size > before.size + 50) {
+      return { changed: "modal", delta: after.size - before.size };
+    }
+    const growth = after.size - before.size;
+    if (growth > 200) return { changed: "dom_growth", delta: growth };
+    return { changed: null, delta: 0 };
+  }
+
+  private async _backtrack(page: Page, before: { url: string }): Promise<void> {
+    try {
+      if (page.url() !== before.url) {
+        await page.goBack({ waitUntil: "domcontentloaded", timeout: 8_000 });
+      } else {
+        // DOM-only change (modal/sidebar) — try Escape, then click body
+        await page.keyboard.press("Escape").catch(() => {});
+        await sleep(300);
+      }
+      await sleep(800);
+    } catch {
+      // Hard reset
+      await page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => {});
+      await sleep(1000);
+    }
+  }
+
+  private async _deepScout(page: Page, path: TraceAction[], depth: number): Promise<void> {
+    const MAX_DEPTH = 3;
+    const MAX_BREADTH = 4;
+    if (depth >= MAX_DEPTH) {
+      this._commitChain(path);
+      return;
+    }
+    if (Date.now() > this.scoutDeadline) {
+      this._commitChain(path);
+      return;
+    }
+
+    // Get top-N actionable elements at the current state
+    const elements = (await page.evaluate(DOM_SCRIPT).catch(() => [])) as
+      | { name: string; role: string; x: number; y: number; isInput?: boolean; aboveFold?: boolean }[]
+      | [];
+
+    // Skip inputs in chain exploration — they need typed values, not bare clicks.
+    // Skip tiny links and elements far below the fold.
+    const candidates = (elements as { name: string; role: string; x: number; y: number; isInput?: boolean; aboveFold?: boolean }[])
+      .filter((el) => !el.isInput && el.name && el.name.length < 60)
+      .slice(0, MAX_BREADTH);
+
+    if (candidates.length === 0) {
+      this._commitChain(path);
+      return;
+    }
+
+    let anyChildAdvanced = false;
+
+    for (const el of candidates) {
+      if (Date.now() > this.scoutDeadline) break;
+
+      const before = await this._snapshotState(page);
+
+      // Try click — quietly skip if it fails
+      try {
+        const safe = el.name.replace(/[^\w\s'-]/g, "").trim();
+        const loc = page
+          .getByRole("button", { name: new RegExp(escapeRe(safe), "i") })
+          .or(page.getByRole("link", { name: new RegExp(escapeRe(safe), "i") }))
+          .or(page.locator(`a:has-text("${safe}")`))
+          .or(page.locator(`button:has-text("${safe}")`))
+          .first();
+        if (!(await loc.count())) continue;
+        await loc.click({ timeout: 4_000, force: false });
+        await sleep(1000);
+      } catch {
+        continue;
+      }
+
+      const after = await this._snapshotState(page);
+      const change = this._detectChange(before, after);
+
+      if (!change.changed) continue; // Dead end — score 0, no recursion
+
+      const action: TraceAction = {
+        element_name: el.name,
+        element_role: el.role,
+        state_change: change.changed,
+        delta_size: change.delta,
+        url_after: after.url,
+      };
+
+      anyChildAdvanced = true;
+      const nextPath = [...path, action];
+      await this.emit("chain_extended", {
+        depth: nextPath.length,
+        action: action.element_name,
+        change: change.changed,
+      });
+
+      await this._deepScout(page, nextPath, depth + 1);
+      await this._backtrack(page, before);
+    }
+
+    if (!anyChildAdvanced && path.length > 0) {
+      this._commitChain(path);
+    }
+  }
+
+  private _commitChain(path: TraceAction[]) {
+    if (path.length === 0) return;
+    const roles = new Set(path.map((a) => a.element_role));
+    const chain: ExplorationChain = {
+      start_url: this.url,
+      actions: path,
+      length: path.length,
+      diversity: roles.size,
+      score: path.length * roles.size,
+    };
+    this.globalTraceLog.push(chain);
   }
 
   // ── Strategise ────────────────────────────────────────────────────────────
@@ -573,6 +740,12 @@ export class DemoAgent {
       reasoning: `Reveal the ${productName} hero section`,
     });
 
+    // ── Maximum Value Path: use the highest-scoring explored chain ──
+    const sortedChains = [...this.globalTraceLog].sort((a, b) => b.score - a.score);
+    const heroChain = sortedChains[0];
+    const spotlights = sortedChains.slice(1, 3).filter((c) => c.score >= 2);
+    const usedActions = new Set<string>();
+
     // ── ACT 2: HERO ACTION (10–40s) — guaranteed real interaction ──
     if (act2Url) {
       steps.push({
@@ -582,7 +755,29 @@ export class DemoAgent {
       });
     }
 
-    if (inputSelector) {
+    // Hero chain takes priority over input/button heuristics when it's strong
+    if (heroChain && heroChain.score >= 3) {
+      for (const action of heroChain.actions.slice(0, 3)) {
+        usedActions.add(action.element_name);
+        steps.push({
+          action: "click",
+          selector_strategy: "button_text",
+          selector_value: action.element_name,
+          aria_name: action.element_name,
+          reasoning: `Click "${action.element_name}" — explored chain showed this reveals ${action.state_change === "url" ? "a new page" : action.state_change === "modal" ? "an interactive modal" : "new product UI"}`,
+        });
+        steps.push({
+          action: "wait_for_mutation",
+          value: "6",
+          reasoning: "Wait for UI to settle",
+        });
+      }
+      steps.push({
+        action: "scroll",
+        scroll_amount: 500,
+        reasoning: "Reveal the result of the interaction",
+      });
+    } else if (inputSelector) {
       steps.push({
         action: "type",
         selector_strategy: "placeholder",
@@ -628,8 +823,33 @@ export class DemoAgent {
       });
     }
 
-    // ── ACT 3: DEPTH (40–60s) ──
-    if (act3Page) {
+    // ── ACT 3: DEPTH (40–60s) — Feature Spotlights from secondary chains ──
+    const spotlightActions = spotlights
+      .flatMap((c) => c.actions.slice(0, 1))
+      .filter((a) => !usedActions.has(a.element_name))
+      .slice(0, 2);
+
+    if (spotlightActions.length > 0) {
+      for (const action of spotlightActions) {
+        steps.push({
+          action: "click",
+          selector_strategy: "button_text",
+          selector_value: action.element_name,
+          aria_name: action.element_name,
+          reasoning: `Click "${action.element_name}" to spotlight another ${productName} feature`,
+        });
+        steps.push({
+          action: "wait_for_mutation",
+          value: "5",
+          reasoning: "Let the feature surface",
+        });
+      }
+      steps.push({
+        action: "scroll",
+        scroll_amount: 500,
+        reasoning: `Close out the ${productName} demo`,
+      });
+    } else if (act3Page) {
       steps.push({
         action: "navigate",
         url: act3Page.url,
@@ -654,6 +874,9 @@ export class DemoAgent {
       has_input: !!inputSelector,
       has_button: !!buttonSelector,
       has_secondary_page: !!act3Page,
+      hero_chain_score: heroChain?.score ?? 0,
+      hero_chain_length: heroChain?.length ?? 0,
+      spotlights: spotlights.length,
     });
     return steps;
   }

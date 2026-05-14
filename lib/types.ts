@@ -11,6 +11,22 @@ export interface PlanStep {
   reasoning: string;
 }
 
+export interface TraceAction {
+  element_name: string;
+  element_role: string;
+  state_change: "url" | "dom_growth" | "modal" | null;
+  delta_size: number;
+  url_after: string;
+}
+
+export interface ExplorationChain {
+  start_url: string;
+  actions: TraceAction[];
+  diversity: number; // unique element roles in the chain
+  length: number;
+  score: number;
+}
+
 export interface ProductProfile {
   product_name: string;
   product_category: "speech_ai" | "coding_tool" | "design_tool" | "data_tool" | "productivity" | "ecommerce" | "other";
