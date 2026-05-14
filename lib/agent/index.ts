@@ -724,9 +724,163 @@ export class DemoAgent {
     }
   }
 
-  // ── Plan ─────────────────────────────────────────────────────────────────
+  // ── Plan: Aggressive Director (LLM) with algorithmic safety net ──────────
 
   private async _plan(profile: ProductProfile): Promise<PlanStep[]> {
+    const deepElements = this._extractDeepElements();
+
+    // No verified scout data → use the algorithmic plan directly. The LLM
+    // would have nothing concrete to ground its choices.
+    if (deepElements.length === 0) {
+      await this.emit("plan_strategy", { mode: "algorithmic", reason: "no_scout_data" });
+      return this._buildAlgorithmicPlan(profile);
+    }
+
+    // Two attempts at the Aggressive Director — second one carries a penalty.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const penalty = attempt === 0
+        ? ""
+        : "\n\n⚠️ PREVIOUS PLAN REJECTED — it was too lazy (too many scroll actions OR no type/click). " +
+          "This time you MUST include at least 2 clicks AND a type step. Maximum 1 scroll.";
+      try {
+        const plan = await this._planWithDirector(profile, deepElements, penalty);
+        if (plan && this._validatePlan(plan, !!profile.hero_input_placeholder)) {
+          await this.emit("plan_strategy", { mode: "llm_director", attempt, steps: plan.length });
+          return plan;
+        }
+        await this.emit("plan_rejected", { attempt, reason: "validation_failed" });
+      } catch (e) {
+        await this.emit("plan_rejected", { attempt, reason: String(e) });
+      }
+    }
+
+    // LLM produced lazy/invalid plans twice — fall back to the verified algorithmic plan
+    await this.emit("plan_strategy", { mode: "algorithmic", reason: "llm_lazy_fallback" });
+    return this._buildAlgorithmicPlan(profile);
+  }
+
+  // ── Extract Deep Elements from the scout trace log ───────────────────────
+  // Signal-to-Noise: drop dead-end elements (those would never be in the log
+  // anyway — _deepScout only commits chains with state-change actions).
+  // Rank by max chain depth that the element unlocks, return top 10.
+
+  private _extractDeepElements(): Array<{
+    name: string;
+    role: string;
+    state_change: string;
+    chain_depth: number;
+  }> {
+    const map = new Map<string, {
+      name: string;
+      role: string;
+      state_change: string;
+      chain_depth: number;
+    }>();
+    for (const chain of this.globalTraceLog) {
+      chain.actions.forEach((action, idx) => {
+        // chain_depth = how many more steps this element leads to (1 + remaining)
+        const depth = chain.length - idx;
+        const existing = map.get(action.element_name);
+        if (!existing || depth > existing.chain_depth) {
+          map.set(action.element_name, {
+            name: action.element_name,
+            role: action.element_role,
+            state_change: action.state_change ?? "none",
+            chain_depth: depth,
+          });
+        }
+      });
+    }
+    return [...map.values()]
+      .filter((e) => e.chain_depth > 0)
+      .sort((a, b) => b.chain_depth - a.chain_depth)
+      .slice(0, 10);
+  }
+
+  // ── Mechanical Validation: reject lazy plans ──────────────────────────────
+
+  private _validatePlan(steps: PlanStep[], hasInput: boolean): boolean {
+    if (steps.length < 5 || steps.length > 8) return false;
+    if (steps[0]?.action !== "navigate") return false;
+    if (steps[0]?.url !== this.url) return false;
+
+    const scrollCount = steps.filter((s) => s.action === "scroll").length;
+    if (scrollCount > 2) return false; // Aggressive Director cap
+
+    const interactions = steps.filter((s) => s.action === "click" || s.action === "type");
+    if (interactions.length < 1) return false; // step 2 must interact
+
+    // If we know there's a hero input, the plan MUST type into it
+    if (hasInput && !steps.some((s) => s.action === "type")) return false;
+
+    // No repeated element names (selector_value uniqueness)
+    const seen = new Set<string>();
+    for (const s of steps) {
+      const v = (s.selector_value || s.aria_name || "").trim().toLowerCase();
+      if (!v) continue;
+      if (seen.has(v)) return false;
+      seen.add(v);
+    }
+    return true;
+  }
+
+  // ── Aggressive Director LLM call ─────────────────────────────────────────
+
+  private async _planWithDirector(
+    profile: ProductProfile,
+    deepElements: Array<{ name: string; role: string; state_change: string; chain_depth: number }>,
+    penalty: string,
+  ): Promise<PlanStep[] | null> {
+    const elementList = deepElements
+      .map((e, i) => `  ${i + 1}. "${e.name}" (${e.role}) → state_change=${e.state_change}, chain_depth=${e.chain_depth}`)
+      .join("\n");
+
+    const prompt = [
+      "You are an Elite Technical Demo Artist. You are PROHIBITED from using 'scroll' as a primary action.",
+      "",
+      `PRODUCT: ${profile.product_name} (${profile.product_category})`,
+      `CORE FEATURE: ${profile.core_action}`,
+      `WOW MOMENT: ${profile.demo_wow_moment}`,
+      profile.hero_input_placeholder
+        ? `HERO INPUT PLACEHOLDER: "${profile.hero_input_placeholder}"   DEMO TEXT TO TYPE: "${profile.demo_input_value}"`
+        : `HERO INPUT: none discovered — type action not required`,
+      "",
+      "DEEP ELEMENTS (verified during scouting — each produced a real state change):",
+      elementList,
+      "",
+      "CONSTRAINTS — violate any of these and your plan will be REJECTED:",
+      `1. Step 1 MUST be {"action":"navigate","url":"${this.url}"}`,
+      "2. Step 2 MUST be a click or type on a Hero Element from the list above",
+      profile.hero_input_placeholder
+        ? `3. You MUST include at least ONE "type" action with selector_value="${profile.hero_input_placeholder}" and value="${profile.demo_input_value}"`
+        : `3. You MUST include at least TWO click actions on Deep Elements`,
+      "4. Total steps must be between 5 and 8",
+      "5. Maximum 2 scroll actions in the entire plan (scroll is a transition, NEVER a primary step)",
+      "6. Do NOT repeat any element name from the Deep Elements list",
+      "7. For click steps: selector_value MUST be the EXACT string from the Deep Elements list",
+      "8. Use action=wait_for_mutation (value=\"8\") after each click or type to capture the result",
+      penalty,
+      "",
+      "OUTPUT: a raw JSON array only, no markdown, no explanation:",
+      '[{"action":"navigate|click|type|scroll|wait_for_mutation","url":"","selector_strategy":"placeholder|button_text","selector_value":"","value":"","scroll_amount":0,"reasoning":""}]',
+    ].join("\n");
+
+    const reply = await askLLM(prompt, undefined, true);
+    if (!reply) return null;
+    const m = reply.match(/\[[\s\S]*\]/);
+    if (!m) return null;
+    const raw = JSON.parse(m[0]) as PlanStep[];
+    if (!Array.isArray(raw)) return null;
+
+    return raw.map((s) => ({
+      ...s,
+      action: (s.action ?? "scroll").split(/[|\s]/)[0].toLowerCase().trim() as PlanStep["action"],
+    }));
+  }
+
+  // ── Algorithmic Plan (safety net — used when LLM is lazy or no scout data)
+
+  private async _buildAlgorithmicPlan(profile: ProductProfile): Promise<PlanStep[]> {
     // ── Build the plan ALGORITHMICALLY from validated profile + discovered DOM ──
     // The LLM is no longer allowed to author the structure — it hallucinates
     // placeholder text and removes navigate steps. We build PlanStep objects
