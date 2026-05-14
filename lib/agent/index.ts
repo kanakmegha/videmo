@@ -178,6 +178,21 @@ export class DemoAgent {
   private globalTraceLog: ExplorationChain[] = [];
   private scoutDeadline  = 0; // ms timestamp — abort scout when exceeded
 
+  // ── ActionRegistry ────────────────────────────────────────────────────────
+  // Each interaction is fingerprinted so the agent never repeats itself.
+  // Action ID = hash(url + element_name + action_type + position)
+  private actionHistory  = new Set<string>(); // performed at least once
+  private blacklist      = new Set<string>(); // performed AND produced no state change
+  private urlVisitsInChain = new Map<string, number>(); // for loop detection
+
+  private _actionId(url: string, name: string, action: string, x = 0, y = 0): string {
+    // Cheap deterministic hash — collisions extremely unlikely here
+    const raw = `${url}|${name.trim().toLowerCase()}|${action}|${Math.round(x / 20) * 20}|${Math.round(y / 20) * 20}`;
+    let h = 0;
+    for (let i = 0; i < raw.length; i++) h = ((h << 5) - h + raw.charCodeAt(i)) | 0;
+    return `a${h}`;
+  }
+
   constructor(
     private jobId: string,
     private url: string,
@@ -424,11 +439,30 @@ export class DemoAgent {
 
     // Skip inputs in chain exploration — they need typed values, not bare clicks.
     // Skip tiny links and elements far below the fold.
+    // Skip elements already in actionHistory or blacklist (ActionRegistry).
+    const currentUrl = page.url();
     const candidates = (elements as { name: string; role: string; x: number; y: number; isInput?: boolean; aboveFold?: boolean }[])
       .filter((el) => !el.isInput && el.name && el.name.length < 60)
+      .filter((el) => {
+        const id = this._actionId(currentUrl, el.name, "click", el.x, el.y);
+        return !this.actionHistory.has(id) && !this.blacklist.has(id);
+      })
       .slice(0, MAX_BREADTH);
 
+    // Dead-End Rule: every action on this page is already exhausted
     if (candidates.length === 0) {
+      this._commitChain(path);
+      return;
+    }
+
+    // Loop Detection: same URL hit > 3 times in this chain — reset to home
+    const visits = (this.urlVisitsInChain.get(currentUrl) ?? 0) + 1;
+    this.urlVisitsInChain.set(currentUrl, visits);
+    if (visits > 3) {
+      await this.emit("loop_detected", { url: currentUrl, visits });
+      this.urlVisitsInChain.clear();
+      await page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => {});
+      await sleep(1000);
       this._commitChain(path);
       return;
     }
@@ -438,6 +472,7 @@ export class DemoAgent {
     for (const el of candidates) {
       if (Date.now() > this.scoutDeadline) break;
 
+      const actionId = this._actionId(currentUrl, el.name, "click", el.x, el.y);
       const before = await this._snapshotState(page);
 
       // Try click — quietly skip if it fails
@@ -450,6 +485,7 @@ export class DemoAgent {
           .or(page.locator(`button:has-text("${safe}")`))
           .first();
         if (!(await loc.count())) continue;
+        this.actionHistory.add(actionId); // record attempt BEFORE click
         await loc.click({ timeout: 4_000, force: false });
         await sleep(1000);
       } catch {
@@ -459,7 +495,10 @@ export class DemoAgent {
       const after = await this._snapshotState(page);
       const change = this._detectChange(before, after);
 
-      if (!change.changed) continue; // Dead end — score 0, no recursion
+      if (!change.changed) {
+        this.blacklist.add(actionId); // dead end — never try again
+        continue;
+      }
 
       const action: TraceAction = {
         element_name: el.name,
@@ -1065,7 +1104,26 @@ export class DemoAgent {
   // ── Execute action ────────────────────────────────────────────────────────
 
   private async _performAction(page: Page, step: PlanStep, stepIndex: number): Promise<boolean> {
+    // ActionRegistry guardrail: skip click/type if exact action was already done
+    // (Scroll, wait, navigate, wait_for_mutation are idempotent — never skipped.)
+    if (step.action === "click" || step.action === "type") {
+      const sel = step.selector_value || step.aria_name || "";
+      if (sel) {
+        const id = this._actionId(page.url(), sel, step.action);
+        if (this.actionHistory.has(id) || this.blacklist.has(id)) {
+          await this.emit("action_skipped", { reason: "already_performed", id, step: stepIndex });
+          return false;
+        }
+        this.actionHistory.add(id);
+      }
+    }
+
+    const originalAction = step.action;
     try {
+      // Snapshot state BEFORE action so we can detect redundant clicks
+      const beforeState =
+        originalAction === "click" ? await this._snapshotState(page) : null;
+
       switch (step.action) {
         case "navigate": {
           await this._navigateTo(page, step.url ?? this.url);
@@ -1230,6 +1288,21 @@ export class DemoAgent {
           break;
         }
       }
+
+      // Post-click state-change check: if the click produced nothing, blacklist
+      // it so any later step that resolves to the same selector won't re-try.
+      if (originalAction === "click" && beforeState) {
+        const after = await this._snapshotState(page);
+        const change = this._detectChange(beforeState, after);
+        if (!change.changed) {
+          const sel = step.selector_value || step.aria_name || "";
+          if (sel) {
+            this.blacklist.add(this._actionId(page.url(), sel, "click"));
+            await this.emit("action_blacklisted", { reason: "no_state_change", step: stepIndex });
+          }
+        }
+      }
+
       return true;
     } catch {
       return false;
