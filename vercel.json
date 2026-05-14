@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "functions": {
-    "api/*.py": {
-      "maxDuration": 30
-    }
+  "buildCommand": "npm run build",
+  "framework": "nextjs",
+  "env": {
+    "AGENT_API_URL": "@agent-api-url"
   }
 }
