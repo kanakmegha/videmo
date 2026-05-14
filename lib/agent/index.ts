@@ -184,6 +184,7 @@ export class DemoAgent {
   private actionHistory  = new Set<string>(); // performed at least once
   private blacklist      = new Set<string>(); // performed AND produced no state change
   private urlVisitsInChain = new Map<string, number>(); // for loop detection
+  private seenResultStates = new Set<string>(); // (4) Visual Mutation Guardrail
 
   private _actionId(url: string, name: string, action: string, x = 0, y = 0): string {
     // Cheap deterministic hash — collisions extremely unlikely here
@@ -390,6 +391,25 @@ export class DemoAgent {
     return { url, ...data };
   }
 
+  // Fingerprint the "result" state after a click — used to detect when
+  // two different clicks produce the same visual outcome (modal contents,
+  // sidebar contents, navigated page).
+  private async _resultFingerprint(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const url = location.href;
+        // Use visible text only — strips ids/classes that change between loads
+        const text = (document.body.innerText ?? "").slice(0, 1500);
+        // Cheap rolling hash
+        let h = 0;
+        for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+        return `${url}#${h}`;
+      });
+    } catch {
+      return page.url();
+    }
+  }
+
   private _detectChange(
     before: { url: string; size: number; topZ: number },
     after:  { url: string; size: number; topZ: number }
@@ -499,6 +519,18 @@ export class DemoAgent {
         this.blacklist.add(actionId); // dead end — never try again
         continue;
       }
+
+      // (4) Visual Mutation Guardrail — if this click resulted in a state
+      // we've already seen from a different click, it's functionally
+      // identical (e.g. two buttons that open the same modal). Score 0.
+      const resultFingerprint = await this._resultFingerprint(page);
+      if (this.seenResultStates.has(resultFingerprint)) {
+        this.blacklist.add(actionId);
+        await this.emit("duplicate_state", { action: el.name });
+        await this._backtrack(page, before);
+        continue;
+      }
+      this.seenResultStates.add(resultFingerprint);
 
       const action: TraceAction = {
         element_name: el.name,
@@ -740,13 +772,30 @@ export class DemoAgent {
     for (let attempt = 0; attempt < 2; attempt++) {
       const penalty = attempt === 0
         ? ""
-        : "\n\n⚠️ PREVIOUS PLAN REJECTED — it was too lazy (too many scroll actions OR no type/click). " +
-          "This time you MUST include at least 2 clicks AND a type step. Maximum 1 scroll.";
+        : "\n\n⚠️ PREVIOUS PLAN REJECTED — it was lazy or contained duplicate element names. " +
+          "This time you MUST include at least 2 unique clicks AND a type step. Maximum 1 scroll. " +
+          "Be CREATIVE — pick different elements you haven't used before.";
       try {
-        const plan = await this._planWithDirector(profile, deepElements, penalty);
-        if (plan && this._validatePlan(plan, !!profile.hero_input_placeholder)) {
-          await this.emit("plan_strategy", { mode: "llm_director", attempt, steps: plan.length });
-          return plan;
+        const raw = await this._planWithDirector(profile, deepElements, penalty);
+        if (!raw) {
+          await this.emit("plan_rejected", { attempt, reason: "empty_response" });
+          continue;
+        }
+        // (3) Mechanical Deduplication — strip duplicates the LLM snuck in
+        const deduped = this._dedupePlanSteps(raw);
+        if (deduped.length < 5) {
+          // Too many duplicates removed — force re-plan with creativity push
+          await this.emit("plan_rejected", { attempt, reason: "too_many_duplicates", removed: raw.length - deduped.length });
+          continue;
+        }
+        if (this._validatePlan(deduped, !!profile.hero_input_placeholder)) {
+          await this.emit("plan_strategy", {
+            mode: "llm_director",
+            attempt,
+            steps: deduped.length,
+            deduped: raw.length - deduped.length,
+          });
+          return deduped;
         }
         await this.emit("plan_rejected", { attempt, reason: "validation_failed" });
       } catch (e) {
@@ -797,6 +846,32 @@ export class DemoAgent {
       .slice(0, 10);
   }
 
+  // (3) Mechanical Deduplication — strip repeats of the same action+target.
+  // navigate/scroll/wait/wait_for_mutation can legitimately repeat at different
+  // points (transitions); click and type must NEVER repeat the same selector.
+  private _dedupePlanSteps(steps: PlanStep[]): PlanStep[] {
+    const seen = new Set<string>();
+    const out: PlanStep[] = [];
+    for (const step of steps) {
+      let key: string;
+      if (step.action === "click" || step.action === "type") {
+        const target = (step.selector_value || step.aria_name || "").trim().toLowerCase();
+        key = `${step.action}::${target}`;
+      } else if (step.action === "navigate") {
+        key = `navigate::${(step.url ?? "").trim().toLowerCase()}`;
+      } else {
+        // scroll/wait/wait_for_mutation — allow repeats (transitions)
+        out.push(step);
+        continue;
+      }
+      if (!seen.has(key)) {
+        out.push(step);
+        seen.add(key);
+      }
+    }
+    return out;
+  }
+
   // ── Mechanical Validation: reject lazy plans ──────────────────────────────
 
   private _validatePlan(steps: PlanStep[], hasInput: boolean): boolean {
@@ -831,8 +906,31 @@ export class DemoAgent {
     deepElements: Array<{ name: string; role: string; state_change: string; chain_depth: number }>,
     penalty: string,
   ): Promise<PlanStep[] | null> {
+    // (2) Branching Logic — group elements by the chain that reached them.
+    // The LLM sees: "after clicking X (parent), Y and Z became reachable."
+    // This lets it construct sequential plans like Click X → interact with Y inside X's new state.
+    const chainsByRoot = this.globalTraceLog
+      .filter((c) => c.length > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    const branchText = chainsByRoot.length
+      ? chainsByRoot
+          .map((c, i) => {
+            const path = c.actions
+              .map((a) => `"${a.element_name}" [${a.state_change}]`)
+              .join(" → ");
+            return `  Chain ${i + 1}: ${path}   (score=${c.score})`;
+          })
+          .join("\n")
+      : "  (no multi-step chains discovered — single interactions only)";
+
+    // (1) Mark which deep elements were already interacted with during scout.
     const elementList = deepElements
-      .map((e, i) => `  ${i + 1}. "${e.name}" (${e.role}) → state_change=${e.state_change}, chain_depth=${e.chain_depth}`)
+      .map((e, i) => {
+        const tried = this.actionHistory.size > 0 ? " [SCOUTED]" : "";
+        return `  ${i + 1}. "${e.name}" (${e.role}) → causes ${e.state_change}, depth=${e.chain_depth}${tried}`;
+      })
       .join("\n");
 
     const prompt = [
@@ -848,6 +946,9 @@ export class DemoAgent {
       "DEEP ELEMENTS (verified during scouting — each produced a real state change):",
       elementList,
       "",
+      "ACTION CHAINS (sequential branches — each arrow = a new state that became reachable):",
+      branchText,
+      "",
       "CONSTRAINTS — violate any of these and your plan will be REJECTED:",
       `1. Step 1 MUST be {"action":"navigate","url":"${this.url}"}`,
       "2. Step 2 MUST be a click or type on a Hero Element from the list above",
@@ -856,9 +957,10 @@ export class DemoAgent {
         : `3. You MUST include at least TWO click actions on Deep Elements`,
       "4. Total steps must be between 5 and 8",
       "5. Maximum 2 scroll actions in the entire plan (scroll is a transition, NEVER a primary step)",
-      "6. Do NOT repeat any element name from the Deep Elements list",
+      "6. UNIQUE ACTION CONSTRAINT — you are STRICTLY FORBIDDEN from using the same element name twice. Every interaction targets a NEW element.",
       "7. For click steps: selector_value MUST be the EXACT string from the Deep Elements list",
       "8. Use action=wait_for_mutation (value=\"8\") after each click or type to capture the result",
+      "9. BRANCHING RULE — if you use an element from a Chain above (e.g. Chain 1 starts with 'History'), the NEXT step should target the SECOND element in that chain (which became reachable AFTER the first click), NOT a fresh top-level element. Follow chains to depth before switching.",
       penalty,
       "",
       "OUTPUT: a raw JSON array only, no markdown, no explanation:",
