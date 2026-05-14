@@ -186,6 +186,9 @@ export class DemoAgent {
   private urlVisitsInChain = new Map<string, number>(); // for loop detection
   private seenResultStates = new Set<string>(); // (4) Visual Mutation Guardrail
 
+  // Level-2 hierarchy: parent click → children elements that appeared after click
+  private hierarchyLog = new Map<string, { children: string[]; entropy: "high" | "low" }>();
+
   private _actionId(url: string, name: string, action: string, x = 0, y = 0): string {
     // Cheap deterministic hash — collisions extremely unlikely here
     const raw = `${url}|${name.trim().toLowerCase()}|${action}|${Math.round(x / 20) * 20}|${Math.round(y / 20) * 20}`;
@@ -495,6 +498,11 @@ export class DemoAgent {
       const actionId = this._actionId(currentUrl, el.name, "click", el.x, el.y);
       const before = await this._snapshotState(page);
 
+      // Snapshot element names BEFORE click — used to compute "children that appeared"
+      const preNames = new Set(
+        (elements as { name: string }[]).map((e) => e.name).filter(Boolean)
+      );
+
       // Try click — quietly skip if it fails
       try {
         const safe = el.name.replace(/[^\w\s'-]/g, "").trim();
@@ -507,6 +515,7 @@ export class DemoAgent {
         if (!(await loc.count())) continue;
         this.actionHistory.add(actionId); // record attempt BEFORE click
         await loc.click({ timeout: 4_000, force: false });
+        await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
         await sleep(1000);
       } catch {
         continue;
@@ -531,6 +540,21 @@ export class DemoAgent {
         continue;
       }
       this.seenResultStates.add(resultFingerprint);
+
+      // ── (1) Level-2 Scouting ─────────────────────────────────────────────
+      // Run a mini-discovery on the new state — capture elements that did NOT
+      // exist before the click. These are the "children" of this parent.
+      const postEls = (await page.evaluate(DOM_SCRIPT).catch(() => [])) as
+        | { name: string; role: string }[];
+      const children = (postEls as { name: string; role: string }[])
+        .filter((e) => e.name && !preNames.has(e.name))
+        .map((e) => e.name)
+        .slice(0, 6);
+
+      // (2) High-Entropy flag — true when the click revealed >= 2 new elements
+      const entropy: "high" | "low" = children.length >= 2 ? "high" : "low";
+      this.hierarchyLog.set(el.name, { children, entropy });
+      await this.emit("level2_discovered", { parent: el.name, children: children.length, entropy });
 
       const action: TraceAction = {
         element_name: el.name,
@@ -1002,13 +1026,14 @@ export class DemoAgent {
     penalty: string,
     allLabels: string[],
   ): Promise<PlanStep[] | null> {
-    // (2) Branching Logic — group elements by the chain that reached them.
-    // The LLM sees: "after clicking X (parent), Y and Z became reachable."
-    // This lets it construct sequential plans like Click X → interact with Y inside X's new state.
-    const chainsByRoot = this.globalTraceLog
-      .filter((c) => c.length > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+    // (2) High-Entropy filter — only feed chains where the parent has
+    // high-entropy children (state change opened a real interactive surface).
+    const isHighEntropyChain = (chain: { actions: { element_name: string }[] }) =>
+      chain.actions.some((a) => this.hierarchyLog.get(a.element_name)?.entropy === "high");
+
+    const allChains = [...this.globalTraceLog].sort((a, b) => b.score - a.score);
+    const highEntropyChains = allChains.filter(isHighEntropyChain).slice(0, 5);
+    const chainsByRoot = highEntropyChains.length > 0 ? highEntropyChains : allChains.slice(0, 5);
 
     const branchText = chainsByRoot.length
       ? chainsByRoot
@@ -1020,6 +1045,18 @@ export class DemoAgent {
           })
           .join("\n")
       : "  (no multi-step chains discovered — single interactions only)";
+
+    // (1+3) Level-2 Hierarchies — parent → children that became reachable after click
+    const hierarchyEntries = [...this.hierarchyLog.entries()]
+      .filter(([, v]) => v.children.length > 0)
+      .sort((a, b) => b[1].children.length - a[1].children.length)
+      .slice(0, 8);
+
+    const hierarchyText = hierarchyEntries.length
+      ? hierarchyEntries
+          .map(([parent, v]) => `  "${parent}" (${v.entropy.toUpperCase()} entropy) → reveals: ${JSON.stringify(v.children)}`)
+          .join("\n")
+      : "  (no parent→child hierarchies discovered)";
 
     // (1) Mark which deep elements were already interacted with during scout.
     const elementList = deepElements
@@ -1045,6 +1082,9 @@ export class DemoAgent {
       "ACTION CHAINS (sequential branches — each arrow = a new state that became reachable):",
       branchText,
       "",
+      "LEVEL-2 HIERARCHIES (parent → children that appeared AFTER the parent was clicked):",
+      hierarchyText,
+      "",
       `AVAILABLE TARGET LABELS (${allLabels.length} total — your selector_value MUST be one of these EXACT strings):`,
       JSON.stringify(allLabels.slice(0, 25)),
       "",
@@ -1060,7 +1100,7 @@ export class DemoAgent {
       "7. DESCRIPTIVE MANDATE — every step MUST have a non-empty 'reasoning' field explaining the value to the user (e.g. 'Click Templates to show pre-built designs the user can start from').",
       "8. NO GENERIC CLICKS — every click or type MUST have a non-empty selector_value that EXACTLY matches an item in AVAILABLE TARGET LABELS. Steps without a target will be discarded.",
       "9. Use action=wait_for_mutation (value=\"8\") after each click or type to capture the result",
-      "10. BRANCHING RULE — if you use an element from a Chain above, the NEXT step should target the SECOND element in that same chain (which became reachable AFTER the first click), not a fresh top-level element.",
+      "10. DEEP-DIVE RULE — Do NOT just click a button and scroll. If a parent in LEVEL-2 HIERARCHIES reveals children (e.g. clicking 'History' reveals 'Clear History', 'Search Logs'), your NEXT step MUST be a click or type on one of those children. Build a deep-dive journey, not a surface tour. Always go parent → child → child-of-child where possible.",
       penalty,
       "",
       "OUTPUT: a raw JSON array only, no markdown, no explanation:",
