@@ -1,3 +1,6 @@
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
 import os
 import asyncio
 import base64
@@ -13,7 +16,50 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 from typing import Optional, List, Set, Dict, Any, TypedDict
 from openai import OpenAI
 from playwright_stealth import Stealth
+import sqlite3
+import shutil
 
+def steal_chrome_cookies(self, domain_filter: str = None) -> list:
+    """Copy login cookies from your real Chrome into Playwright."""
+    chrome_cookies_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies"
+    
+    if not chrome_cookies_path.exists():
+        print("[Auth] Chrome cookies not found.")
+        return []
+
+    # Copy DB (Chrome locks it while open)
+    tmp = Path(tempfile.mktemp(suffix=".db"))
+    shutil.copy2(chrome_cookies_path, tmp)
+    
+    cookies = []
+    try:
+        conn = sqlite3.connect(tmp)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT host_key, name, value, path, 
+                   expires_utc, is_secure, is_httponly
+            FROM cookies
+            WHERE host_key LIKE ?
+        """, (f"%{domain_filter}%" if domain_filter else "%",))
+        
+        for row in cursor.fetchall():
+            cookies.append({
+                "name": row[1],
+                "value": row[2],
+                "domain": row[0],
+                "path": row[3],
+                "secure": bool(row[5]),
+                "httpOnly": bool(row[6]),
+                "sameSite": "Lax"
+            })
+        conn.close()
+    except Exception as e:
+        print(f"[Auth] Cookie read failed: {e}")
+    finally:
+        tmp.unlink(missing_ok=True)
+    
+    print(f"[Auth] Stolen {len(cookies)} cookies from Chrome.")
+    return cookies
 async def stealth(page_or_context):
     """Bridge for playwright-stealth v2.0.3+ to support await stealth(page)"""
     await Stealth().apply_stealth_async(page_or_context)
@@ -59,6 +105,14 @@ class SiteMap:
     def __init__(self):
         self.pages: Dict[str, PageInfo] = {}
         self.global_features: List[str] = []
+        self.scout_log: List[Dict[str, str]] = [] # DiscoveryLog
+
+    def add_scout_entry(self, url: str, summary: str, thumbnail: str):
+        self.scout_log.append({
+            "url": url,
+            "summary": summary,
+            "thumbnail": thumbnail
+        })
 
     def add_page(self, url: str, title: str, elements: List[dict]):
         self.pages[url] = {
@@ -99,58 +153,80 @@ class StateEngine:
             "director_script": [],
             "current_node": "PRE_AUTH"
         }
-
+    def steal_chrome_cookies(self, domain_filter: str = None) -> list:
+        """
+        Instead of decrypting cookies (complex on macOS),
+        copy Chrome's entire Default profile so Playwright 
+        inherits the full authenticated session.
+        """
+        chrome_default = Path.home() / "Library/Application Support/Google/Chrome/Default"
+        antigravity_default = Path(self.session_data_dir) / "Default"
+    
+        if not chrome_default.exists():
+            print("[Auth] Chrome Default profile not found.")
+            return []
+    
+    # Items to copy that carry session/login state
+        items_to_copy = [
+        "Cookies",
+        "Local Storage",
+        "Session Storage", 
+        "IndexedDB",
+        "Login Data",
+        "Web Data",
+        "Preferences"
+    ]
+    
+        antigravity_default.mkdir(parents=True, exist_ok=True)
+    
+        for item in items_to_copy:
+            src = chrome_default / item
+            dst = antigravity_default / item
+            if src.exists():
+                try:
+                    if src.is_dir():
+                        if dst.exists():
+                            shutil.rmtree(dst)
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                        print(f"[Auth] Copied: {item}")
+                except Exception as e:
+                    print(f"[Auth] Skipped {item}: {e}")
+    
+        print("[Auth] Full Chrome session copied → should be auto-logged in.")
+        return []  # No need to inject cookies manually, they're already in the profile
     async def spawn_browser(self, p, record: bool = False):
-        """Initialize a hardened browser context with optional video recording."""
-        # Force Kill Background Chrome to prevent hangs/locks
+        print("[StateEngine] Connecting to your existing Chrome via CDP...")
+    
         try:
-            subprocess.run(["pkill", "-9", "Google Chrome"], capture_output=True)
-            subprocess.run(["pkill", "-9", "chromium"], capture_output=True)
-            subprocess.run(["pkill", "-9", "chrome"], capture_output=True)
-        except: pass
-
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        stealth_args = [
-            "--start-maximized",
-            "--disable-infobars",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-gpu"
-        ]
-
-        print(f"[StateEngine] Spawning Hardened Browser Context (Record: {record})")
-        try:
-            self.session["ctx"] = await p.chromium.launch_persistent_context(
-                user_data_dir=self.session_data_dir,
-                channel="chrome",
-                headless=False,
-                user_agent=user_agent,
-                args=stealth_args,
-                ignore_default_args=["--enable-automation"],
-                record_video_dir=str(REC_DIR) if record else None,
-                viewport=None
-            )
+            # Connect directly to YOUR running Chrome
+            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+        
+            # Use the existing context (your real logged-in session)
+            if browser.contexts:
+                self.session["ctx"] = browser.contexts[0]
+            else:
+                self.session["ctx"] = await browser.new_context()
+        
+            # Use existing page or open new one
+            pages = self.session["ctx"].pages
+            if pages:
+                self.session["pg"] = pages[0]
+            else:
+                self.session["pg"] = await self.session["ctx"].new_page()
+        
+            await stealth(self.session["pg"])
+            self.session["ctx"].on("page", lambda pg: asyncio.create_task(self.setup_popup(pg)))
+        
+            print(f"[StateEngine] Connected! Navigating to {self.start_url}...")
+            await self.session["pg"].goto(self.start_url, wait_until="domcontentloaded", timeout=30000)
+            return self.session["pg"]
+        
         except Exception as e:
-            if "is already in use" in str(e) or "lock" in str(e).lower():
-                print("\n" + "!"*60)
-                print(f"Kanak, please close your Chrome browser!")
-                print("I need to borrow your session to bypass the Google Login.")
-                print("!"*60 + "\n")
-                raise RuntimeError("CHROME LOCK ERROR: Profile in use.")
-            raise e
-
-        # Setup initial page
-        self.session["pg"] = self.session["ctx"].pages[0] if self.session["ctx"].pages else await self.session["ctx"].new_page()
-        
-        # Apply stealth to every page and popup
-        await stealth(self.session["pg"])
-        self.session["ctx"].on("page", lambda p: asyncio.create_task(self.setup_popup(p)))
-        
-        # Seamlessly navigate to target URL immediately
-        print(f"[StateEngine] Navigating to: {self.start_url}")
-        await self.session["pg"].goto(self.start_url, wait_until="domcontentloaded")
-
-        return self.session["pg"]
-
+            print(f"[StateEngine] CDP connection failed: {e}")
+            print("Make sure Chrome is running with: --remote-debugging-port=9222")
+            raise
     async def setup_popup(self, p):
         """Configure popups with stealth and auto-login logic."""
         try:
@@ -193,10 +269,13 @@ class StateEngine:
             try:
                 # Phase 1: Pre-Flight Auth (No Video)
                 await self.spawn_browser(p, record=False)
-                self.session["current_node"] = await self.node_pre_auth()
+                await self.node_pre_auth()
                 
-                # Phase 2: Production Recording (Close and Relaunch with Video)
-                print("[StateEngine] Finalizing Auth Stage. Relaunching for Cinematic Recording...")
+                # Phase 2: Pre-Scout (Reconnaissance)
+                self.session["current_node"] = await self.node_pre_scout()
+                
+                # Phase 3: Production Recording (Close and Relaunch with Video)
+                print("[StateEngine] Finalizing Recon Stage. Relaunching for Cinematic Recording...")
                 await self.spawn_browser(p, record=True)
                 
                 while self.session["current_node"] != "FINISH":
@@ -265,24 +344,75 @@ class StateEngine:
                         if full_url not in visited and len(visited) < 8:
                             visited.add(full_url)
                             queue.append((full_url, depth + 1))
+                print(f"[Mapper] Scouted: {url}")
             except Exception as e:
-                print(f"[Mapper] Failed to map {url}: {e}")
+                print(f"[Mapper] Failed to scout {url}: {e}")
         
-        return "STRATEGIZE"
+        return "DISCOVER"
+
+    async def node_pre_scout(self) -> str:
+        """Stage: PRE-SCOUT. Visit top 5 links and identify Hero flows."""
+        print("[Pre-Scout] Initiating high-fidelity site reconnaissance...")
+        pg = self.session["pg"]
+        await pg.goto(self.start_url, wait_until="load")
+        
+        # Identify top 5 actionable links
+        links = await pg.query_selector_all('a')
+        scout_targets = []
+        for link in links:
+            href = await link.get_attribute('href')
+            text = await link.inner_text()
+            if href and (href.startswith('/') or self.start_url in href) and text.strip():
+                full_url = href if href.startswith('http') else f"{self.start_url.rstrip('/')}/{href.lstrip('/')}"
+                if full_url != self.start_url and full_url not in [t[0] for t in scout_targets]:
+                    scout_targets.append((full_url, text.strip()))
+            if len(scout_targets) >= 5: break
+            
+        for url, label in scout_targets:
+            try:
+                print(f"[Pre-Scout] Scouting: {label} ({url})")
+                await pg.goto(url, wait_until="networkidle", timeout=10000)
+                await asyncio.sleep(1)
+                
+                # Take thumbnail and get summary via vision
+                thumb_path = REC_DIR / f"thumb_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
+                await pg.screenshot(path=str(thumb_path), type="jpeg", quality=50)
+                
+                b64_img = base64.b64encode(thumb_path.read_bytes()).decode('utf-8')
+                prompt = "Describe this page in one sentence. Focus on its primary interactive feature or value."
+                summary = await self.ask_vision(prompt, b64_img)
+                
+                self.sitemap.add_scout_entry(url, summary, str(thumb_path))
+            except: continue
+            
+        return "DISCOVER"
 
     async def fallback_dom_extract(self, page: Page) -> list:
-        """Extract interactive elements using standard selectors."""
+        """Extract high-fidelity interactive elements using AXTree prioritization."""
         elements = []
-        selectors = ["button", "a", "input", "[role='button']", "[role='link']"]
+        # Filter for visible and enabled elements only
+        selectors = [
+            "button:visible:not([disabled])",
+            "a:visible:not([disabled])",
+            "input:visible:not([disabled])",
+            "[role='button']:visible",
+            "[role='link']:visible"
+        ]
         for selector in selectors:
             try:
                 nodes = await page.query_selector_all(selector)
                 for node in nodes:
+                    # Check visibility heuristic
+                    is_visible = await node.evaluate("el => el.offsetWidth > 0 && el.offsetHeight > 0 && window.getComputedStyle(el).display !== 'none'")
+                    if not is_visible: continue
+                    
                     name = await node.inner_text() or await node.get_attribute("aria-label") or await node.get_attribute("placeholder")
+                    role = await node.get_attribute("role") or selector.split(":")[0].strip("[]'")
+                    
                     if name and name.strip():
                         elements.append({
-                            "role": selector.strip("[]'"),
-                            "name": name.strip(),
+                            "role": role,
+                            "name": name.strip()[:50],
                             "id": hashlib.md5(name.encode()).hexdigest()[:8]
                         })
             except: continue
@@ -340,17 +470,20 @@ class StateEngine:
         high_value_pages = self.sitemap.get_highest_value_pages()
         
         context = "Site Map:\n" + "\n".join([f"- {url}: {p['purpose']} (Value: {p['demo_value']})" for url, p in self.sitemap.pages.items()])
+        scout_info = "Discovery Log (Pre-Scout):\n" + "\n".join([f"- {s['url']}: {s['summary']}" for s in self.sitemap.scout_log])
         
         prompt = (
             "You are a Senior Product Marketer & Demo Director. Create a high-converting, cinematic action sequence.\n"
             f"{context}\n\n"
+            f"{scout_info}\n\n"
             "STRATEGY:\n"
-            "1. Start at Home.\n"
-            "2. Identify the 'Hero Input' (e.g., search, prompt box, email signup).\n"
-            "3. TYPE a high-value demonstration prompt: 'Build a modern hotel booking dashboard with a dark theme'.\n"
-            "4. WAIT for results (mutation).\n"
-            "5. SCROLL to showcase depth.\n"
-            "6. Finish at a high-value secondary page (e.g. Pricing).\n\n"
+            "1. Use the Discovery Log to prioritize high-value flows (e.g., editors, dashboards) over static pages (Students, FAQ).\n"
+            "2. Start at Home.\n"
+            "3. Identify the 'Hero Input' (e.g., search, prompt box).\n"
+            "4. TYPE a high-value demonstration prompt.\n"
+            "5. WAIT for results (mutation).\n"
+            "6. SCROLL to showcase depth.\n"
+            "7. Finish at the most interactive page found during Pre-Scout.\n\n"
             "Output JSON only: [{\"action\": \"navigate|click|type|scroll|wait_mutation\", \"url\": \"...\", \"aria_name\": \"...\", \"value\": \"...\", \"reasoning\": \"...\"}]"
         )
         
