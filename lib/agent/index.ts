@@ -219,7 +219,7 @@ export class DemoAgent {
       this.profile = await this._deepAnalyze(page);
 
       await this.emit("phase", { phase: "plan", message: "Building action plan…" });
-      const steps = await this._plan(this.profile);
+      const steps = await this._plan(this.profile, page);
       return steps;
     } finally {
       await ctx?.close().catch(() => {});
@@ -758,13 +758,22 @@ export class DemoAgent {
 
   // ── Plan: Aggressive Director (LLM) with algorithmic safety net ──────────
 
-  private async _plan(profile: ProductProfile): Promise<PlanStep[]> {
-    const deepElements = this._extractDeepElements();
+  private async _plan(profile: ProductProfile, page?: Page): Promise<PlanStep[]> {
+    // (1) Enrich the Element Feed — collect every unique label we've seen
+    let allLabels = this._collectUniqueLabels();
+    let deepElements = this._extractDeepElements();
 
-    // No verified scout data → use the algorithmic plan directly. The LLM
-    // would have nothing concrete to ground its choices.
-    if (deepElements.length === 0) {
-      await this.emit("plan_strategy", { mode: "algorithmic", reason: "no_scout_data" });
+    // Heuristic: if fewer than 10 unique elements, deepen the crawl
+    if (allLabels.length < 10 && page) {
+      await this.emit("phase", { phase: "discover", message: `Only ${allLabels.length} elements found — deepening DOM crawl…` });
+      await this._deepenCrawl(page);
+      allLabels = this._collectUniqueLabels();
+      deepElements = this._extractDeepElements();
+    }
+
+    // No verified scout data → use the algorithmic plan directly.
+    if (allLabels.length === 0) {
+      await this.emit("plan_strategy", { mode: "algorithmic", reason: "no_elements" });
       return this._buildAlgorithmicPlan(profile);
     }
 
@@ -772,30 +781,32 @@ export class DemoAgent {
     for (let attempt = 0; attempt < 2; attempt++) {
       const penalty = attempt === 0
         ? ""
-        : "\n\n⚠️ PREVIOUS PLAN REJECTED — it was lazy or contained duplicate element names. " +
-          "This time you MUST include at least 2 unique clicks AND a type step. Maximum 1 scroll. " +
-          "Be CREATIVE — pick different elements you haven't used before.";
+        : "\n\n⚠️ PREVIOUS PLAN REJECTED — it was lazy or contained duplicate/empty element names. " +
+          "Pick different elements you haven't used before. If you don't have enough unique elements, " +
+          "RETURN A SHORTER PLAN (4 detailed steps > 8 vague ones).";
       try {
-        const raw = await this._planWithDirector(profile, deepElements, penalty);
+        const raw = await this._planWithDirector(profile, deepElements, penalty, allLabels);
         if (!raw) {
           await this.emit("plan_rejected", { attempt, reason: "empty_response" });
           continue;
         }
-        // (3) Mechanical Deduplication — strip duplicates the LLM snuck in
+        // (3) Mechanical Deduplication — strip repeated targets
         const deduped = this._dedupePlanSteps(raw);
-        if (deduped.length < 5) {
-          // Too many duplicates removed — force re-plan with creativity push
-          await this.emit("plan_rejected", { attempt, reason: "too_many_duplicates", removed: raw.length - deduped.length });
+        // (NEW) Ghost-step filter — drop click/type with empty or off-list selector
+        const cleaned = this._removeGhostSteps(deduped, allLabels);
+        if (cleaned.length < 4) {
+          await this.emit("plan_rejected", { attempt, reason: "too_few_after_cleaning", removed: raw.length - cleaned.length });
           continue;
         }
-        if (this._validatePlan(deduped, !!profile.hero_input_placeholder)) {
+        if (this._validatePlan(cleaned, !!profile.hero_input_placeholder)) {
           await this.emit("plan_strategy", {
             mode: "llm_director",
             attempt,
-            steps: deduped.length,
-            deduped: raw.length - deduped.length,
+            steps: cleaned.length,
+            removed: raw.length - cleaned.length,
+            available_labels: allLabels.length,
           });
-          return deduped;
+          return cleaned;
         }
         await this.emit("plan_rejected", { attempt, reason: "validation_failed" });
       } catch (e) {
@@ -806,6 +817,87 @@ export class DemoAgent {
     // LLM produced lazy/invalid plans twice — fall back to the verified algorithmic plan
     await this.emit("plan_strategy", { mode: "algorithmic", reason: "llm_lazy_fallback" });
     return this._buildAlgorithmicPlan(profile);
+  }
+
+  // ── (1) Enrich Element Feed: union of every label we've discovered ───────
+  // Combines static DOM crawl elements + scouted trace log + DeepAnalyze inputs,
+  // returns deduplicated label strings.
+  private _collectUniqueLabels(): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const add = (name: string | undefined | null) => {
+      if (!name) return;
+      const cleaned = name.trim();
+      if (cleaned.length === 0 || cleaned.length > 80) return;
+      const key = cleaned.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(cleaned);
+    };
+    for (const page of this.sitemap.values()) {
+      for (const el of page.interactive_elements ?? []) {
+        add(el.name);
+        add(el.placeholder);
+        add(el.aria_label);
+      }
+    }
+    for (const chain of this.globalTraceLog) {
+      for (const action of chain.actions) add(action.element_name);
+    }
+    return out;
+  }
+
+  // ── (1) Deepen DOM crawl when fewer than 10 unique elements were found ───
+  // Scrolls the page in 600px increments and re-runs DOM_SCRIPT at each
+  // position so we capture lazy-loaded buttons that weren't in the initial DOM.
+  private async _deepenCrawl(page: Page): Promise<void> {
+    try {
+      await page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      await sleep(1500);
+      const info = this.sitemap.get(this.url) ?? { url: this.url, title: "" };
+      const collected = new Map<string, NonNullable<PageInfo["interactive_elements"]>[number]>();
+      for (const el of info.interactive_elements ?? []) {
+        if (el.name) collected.set(el.name.toLowerCase(), el);
+      }
+      // Scroll + extract three times, then return to top
+      for (let i = 0; i < 4; i++) {
+        const els = (await page.evaluate(DOM_SCRIPT).catch(() => [])) as PageInfo["interactive_elements"];
+        for (const el of els ?? []) {
+          if (el.name && !collected.has(el.name.toLowerCase())) {
+            collected.set(el.name.toLowerCase(), el);
+          }
+        }
+        await page.mouse.wheel(0, 600);
+        await sleep(800);
+      }
+      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+      this.sitemap.set(this.url, {
+        ...info,
+        element_count: collected.size,
+        interactive_elements: [...collected.values()],
+      });
+      await this.emit("crawl_deepened", { unique_elements: collected.size });
+    } catch (e) {
+      await this.emit("crawl_error", { error: String(e) });
+    }
+  }
+
+  // ── (3) Ghost-step filter: drop click/type with empty or off-list target ─
+  private _removeGhostSteps(steps: PlanStep[], availableLabels: string[]): PlanStep[] {
+    const labelSet = new Set(availableLabels.map((l) => l.toLowerCase().trim()));
+    return steps.filter((step) => {
+      if (step.action === "navigate") return !!step.url;
+      if (step.action === "scroll" || step.action === "wait" || step.action === "wait_for_mutation") return true;
+      // click & type — MUST have a target AND it must appear in availableLabels
+      const target = (step.selector_value || step.aria_name || "").trim().toLowerCase();
+      if (!target) return false;
+      // Allow if exact match OR any label contains/is contained by target (LLM rounding)
+      if (labelSet.has(target)) return true;
+      for (const label of labelSet) {
+        if (label.includes(target) || target.includes(label)) return true;
+      }
+      return false;
+    });
   }
 
   // ── Extract Deep Elements from the scout trace log ───────────────────────
@@ -875,7 +967,7 @@ export class DemoAgent {
   // ── Mechanical Validation: reject lazy plans ──────────────────────────────
 
   private _validatePlan(steps: PlanStep[], hasInput: boolean): boolean {
-    if (steps.length < 5 || steps.length > 8) return false;
+    if (steps.length < 4 || steps.length > 8) return false;
     if (steps[0]?.action !== "navigate") return false;
     if (steps[0]?.url !== this.url) return false;
 
@@ -887,6 +979,9 @@ export class DemoAgent {
 
     // If we know there's a hero input, the plan MUST type into it
     if (hasInput && !steps.some((s) => s.action === "type")) return false;
+
+    // (2) Descriptive Mandate — every step needs non-empty reasoning
+    if (steps.some((s) => !s.reasoning || s.reasoning.trim().length < 5)) return false;
 
     // No repeated element names (selector_value uniqueness)
     const seen = new Set<string>();
@@ -905,6 +1000,7 @@ export class DemoAgent {
     profile: ProductProfile,
     deepElements: Array<{ name: string; role: string; state_change: string; chain_depth: number }>,
     penalty: string,
+    allLabels: string[],
   ): Promise<PlanStep[] | null> {
     // (2) Branching Logic — group elements by the chain that reached them.
     // The LLM sees: "after clicking X (parent), Y and Z became reachable."
@@ -949,18 +1045,22 @@ export class DemoAgent {
       "ACTION CHAINS (sequential branches — each arrow = a new state that became reachable):",
       branchText,
       "",
+      `AVAILABLE TARGET LABELS (${allLabels.length} total — your selector_value MUST be one of these EXACT strings):`,
+      JSON.stringify(allLabels.slice(0, 25)),
+      "",
       "CONSTRAINTS — violate any of these and your plan will be REJECTED:",
       `1. Step 1 MUST be {"action":"navigate","url":"${this.url}"}`,
-      "2. Step 2 MUST be a click or type on a Hero Element from the list above",
+      "2. Step 2 MUST be a click or type on an element from the AVAILABLE TARGET LABELS list",
       profile.hero_input_placeholder
         ? `3. You MUST include at least ONE "type" action with selector_value="${profile.hero_input_placeholder}" and value="${profile.demo_input_value}"`
-        : `3. You MUST include at least TWO click actions on Deep Elements`,
-      "4. Total steps must be between 5 and 8",
-      "5. Maximum 2 scroll actions in the entire plan (scroll is a transition, NEVER a primary step)",
-      "6. UNIQUE ACTION CONSTRAINT — you are STRICTLY FORBIDDEN from using the same element name twice. Every interaction targets a NEW element.",
-      "7. For click steps: selector_value MUST be the EXACT string from the Deep Elements list",
-      "8. Use action=wait_for_mutation (value=\"8\") after each click or type to capture the result",
-      "9. BRANCHING RULE — if you use an element from a Chain above (e.g. Chain 1 starts with 'History'), the NEXT step should target the SECOND element in that chain (which became reachable AFTER the first click), NOT a fresh top-level element. Follow chains to depth before switching.",
+        : `3. You MUST include at least TWO click actions on labels from the list`,
+      "4. Total steps must be between 4 and 8. A 4-step DETAILED demo is BETTER than an 8-step VAGUE one. If you run out of unique targets, RETURN A SHORTER PLAN — do not repeat or invent.",
+      "5. Maximum 2 scroll actions (scroll is a transition, NEVER a primary step)",
+      "6. UNIQUE ACTION CONSTRAINT — STRICTLY FORBIDDEN from using the same target label twice.",
+      "7. DESCRIPTIVE MANDATE — every step MUST have a non-empty 'reasoning' field explaining the value to the user (e.g. 'Click Templates to show pre-built designs the user can start from').",
+      "8. NO GENERIC CLICKS — every click or type MUST have a non-empty selector_value that EXACTLY matches an item in AVAILABLE TARGET LABELS. Steps without a target will be discarded.",
+      "9. Use action=wait_for_mutation (value=\"8\") after each click or type to capture the result",
+      "10. BRANCHING RULE — if you use an element from a Chain above, the NEXT step should target the SECOND element in that same chain (which became reachable AFTER the first click), not a fresh top-level element.",
       penalty,
       "",
       "OUTPUT: a raw JSON array only, no markdown, no explanation:",
