@@ -31,6 +31,13 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Next.js
+.next/
+out/
+node_modules/
+npm-debug.log*
+*.tsbuildinfo
+
 # Build
 dist/
 build/

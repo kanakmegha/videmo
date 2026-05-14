@@ -1,8 +1,6 @@
 {
   "version": 2,
-  "functions": {
-    "api/*.py": {
-      "maxDuration": 30
-    }
-  }
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "installCommand": "npm install && npx playwright install chromium --with-deps"
 }
