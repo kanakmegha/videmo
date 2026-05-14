@@ -361,30 +361,52 @@ export class DemoAgent {
     const startInfo = this.sitemap.get(this.url);
     const startElements = (startInfo?.interactive_elements ?? []).slice(0, 30);
 
+    // Detect whether the landing page has a real AI/text input for the type action
+    const hasHeroInput = startElements.some(
+      (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
+    );
+    const heroInputEl = startElements.find(
+      (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
+    );
+
+    const typeRule = hasHeroInput
+      ? `2. TYPE into the hero input. Use aria_name="${heroInputEl?.placeholder || heroInputEl?.name || heroInputEl?.aria_label || ""}". ` +
+        `value="Build a modern hotel booking dashboard with dark theme". ` +
+        `Then add a wait step (value:"5").`
+      : `2. Do NOT add a type step — no text input exists on the landing page. ` +
+        `Instead: click the primary CTA button (e.g. "Get started", "Try free", "Sign up") if visible, ` +
+        `then scroll to reveal the product features.`;
+
     const prompt =
-      "You are a Senior Product Demo Director. Create a compelling, specific demo script.\n\n" +
+      "You are a Senior Product Demo Director creating a screen-recording demo script.\n\n" +
       `Target site: ${this.url}\n` +
       `Discovered pages:\n${pageList}\n\n` +
-      `Landing page elements (use these exact names):\n${JSON.stringify(startElements, null, 2)}\n\n` +
-      "SCRIPT RULES:\n" +
-      "1. navigate to the start URL first.\n" +
-      "2. Find and TYPE into the main hero input/AI prompt box.\n" +
-      "   Use this demo value: 'Build a modern hotel booking dashboard with dark theme'\n" +
-      "3. Add a wait step (value: 5) for AI to generate.\n" +
-      "4. scroll down to reveal the full generated output.\n" +
-      "5. Navigate to the highest demo_value secondary page.\n" +
-      "6. scroll to showcase that page's features.\n" +
-      "7. 5–8 steps total. Use exact element names from the list above.\n\n" +
-      "OUTPUT: a single raw JSON array, no markdown, no explanation:\n" +
-      '[{"action":"navigate|click|type|scroll|wait","url":"...","aria_name":"...","value":"...","reasoning":"..."}]';
+      `Landing page interactive elements (ONLY use aria_name values from this list):\n` +
+      JSON.stringify(startElements.map((e) => ({ name: e.name, placeholder: e.placeholder, role: e.role })), null, 2) +
+      "\n\nSCRIPT RULES — follow exactly:\n" +
+      `1. First step: action="navigate", url="${this.url}".\n` +
+      typeRule + "\n" +
+      "3. scroll down (value:\"800\") to reveal above-the-fold features.\n" +
+      "4. Navigate (action=\"navigate\") to the page with the highest demo_value.\n" +
+      "5. scroll that page to showcase its features.\n" +
+      "6. 5–8 steps total.\n" +
+      "CRITICAL: action must be exactly one of: navigate, click, type, scroll, wait — never combined.\n" +
+      "aria_name must be the EXACT name/placeholder string from the element list above, not a description.\n\n" +
+      "OUTPUT: one raw JSON array only, no markdown fences, no explanation:\n" +
+      '[{"action":"navigate","url":"...","aria_name":"","value":"","reasoning":"..."}]';
 
     try {
-      const reply = await askLLM(prompt, undefined, true); // text-only, faster
+      const reply = await askLLM(prompt, undefined, true);
       if (!reply) throw new Error("Empty LLM response");
       const m = reply.match(/\[[\s\S]*\]/);
       if (!m) throw new Error(`No JSON array found. LLM said: ${reply.slice(0, 200)}`);
-      const steps = JSON.parse(m[0]) as PlanStep[];
-      if (!Array.isArray(steps) || steps.length === 0) throw new Error("Empty plan");
+      const raw = JSON.parse(m[0]) as PlanStep[];
+      if (!Array.isArray(raw) || raw.length === 0) throw new Error("Empty plan");
+      // Normalise action names: strip anything after | or space, lowercase
+      const steps = raw.map((s) => ({
+        ...s,
+        action: (s.action ?? "scroll").split(/[|\s]/)[0].toLowerCase().trim() as PlanStep["action"],
+      }));
       await this.emit("plan_llm", { used: true, steps: steps.length });
       return steps;
     } catch (e) {
@@ -529,22 +551,32 @@ export class DemoAgent {
         }
 
         case "type": {
+          // aria_name must be the real placeholder/label from the element list,
+          // not a prose description — we still try it first but fall through broadly
           const name = step.aria_name ?? "";
           const text = step.value || "Build a modern hotel booking dashboard with dark theme";
 
-          // Try progressively broader selectors until one sticks
+          // Short names (<= 4 words) are likely real element labels; longer ones are
+          // prose descriptions the LLM hallucinated — skip the name-based selectors
+          const nameIsUsable = name.trim().split(/\s+/).length <= 4;
+
           const selectors = [
-            ...(name
+            ...(nameIsUsable && name
               ? [
                   page.getByPlaceholder(new RegExp(escapeRe(name), "i")).first(),
                   page.getByLabel(new RegExp(escapeRe(name), "i")).first(),
                   page.locator(`[aria-placeholder*="${name}" i]`).first(),
+                  page.locator(`[placeholder*="${name}" i]`).first(),
                 ]
               : []),
-            page.locator("textarea").first(),
+            // Generic fallbacks — largest visible input wins
+            page.locator("textarea:visible").first(),
             page.getByRole("textbox").first(),
-            page.locator('[contenteditable="true"]').first(),
-            page.locator("input[type=text]").first(),
+            page.locator('[contenteditable="true"]:visible').first(),
+            page.locator("input[type=text]:visible").first(),
+            page.locator("input[type=search]:visible").first(),
+            page.locator("input[type=email]:visible").first(),
+            page.locator("input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):visible").first(),
           ];
 
           let typed = false;
@@ -553,11 +585,11 @@ export class DemoAgent {
               if ((await loc.count()) && (await loc.isVisible())) {
                 await loc.scrollIntoViewIfNeeded();
                 await loc.click();
-                await sleep(200);
+                await sleep(300);
                 await loc.fill(text);
                 await sleep(400);
                 await loc.press("Enter");
-                await sleep(4000); // wait for AI response
+                await sleep(4000);
                 typed = true;
                 break;
               }
