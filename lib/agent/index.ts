@@ -107,12 +107,28 @@ async function launchContext(
 
 // ── DOM extraction ────────────────────────────────────────────────────────────
 
+// Pre-Plan Filter: extract only HERO elements — drop footer/nav/social noise so the
+// LLM sees the actionable elements (inputs + primary CTAs) without distraction.
 const DOM_SCRIPT = `(() => {
   const seen = new Set();
   const items = [];
+  const NOISE = /privacy|terms|cookie|footer|copyright|©|github|twitter|linkedin|facebook|instagram|youtube|tiktok|discord|imprint|legal|status|changelog|careers/i;
+
+  const isInFooter = (el) => {
+    let p = el;
+    while (p && p !== document.body) {
+      const tag = p.tagName?.toLowerCase();
+      const role = p.getAttribute?.('role');
+      if (tag === 'footer' || role === 'contentinfo') return true;
+      p = p.parentElement;
+    }
+    return false;
+  };
+
   document.querySelectorAll(
-    'button, a[href], input, textarea, [role="button"], [role="textbox"], [contenteditable="true"]'
+    'button, a[href], input, textarea, [role="button"], [role="textbox"], [role="menuitem"], [contenteditable="true"]'
   ).forEach((el, i) => {
+    if (isInFooter(el)) return;
     const r = el.getBoundingClientRect();
     if (!r.width || !r.height) return;
     const s = getComputedStyle(el);
@@ -120,7 +136,9 @@ const DOM_SCRIPT = `(() => {
     const name = (el.innerText||el.value||el.placeholder||
       el.getAttribute('aria-label')||el.getAttribute('aria-placeholder')||'').trim().slice(0,100);
     if (!name || seen.has(name)) return;
+    if (NOISE.test(name)) return; // skip footer/social/legal links
     seen.add(name);
+    const isInput = ['INPUT','TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable')==='true';
     items.push({
       id:'el-'+i, name,
       role: el.getAttribute('role')||el.tagName.toLowerCase(),
@@ -128,9 +146,18 @@ const DOM_SCRIPT = `(() => {
       placeholder: el.placeholder||el.getAttribute('aria-placeholder')||'',
       x: Math.round(r.left+r.width/2),
       y: Math.round(r.top+r.height/2),
-      isInput: ['INPUT','TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable')==='true',
+      isInput,
+      // y position helps the LLM identify hero elements (above the fold) vs below
+      aboveFold: r.top < 800,
     });
-    if (items.length>=80) return;
+    if (items.length>=50) return;
+  });
+
+  // Sort: inputs first, then buttons in viewport top-to-bottom, prefer above-the-fold
+  items.sort((a, b) => {
+    if (a.isInput !== b.isInput) return a.isInput ? -1 : 1;
+    if (a.aboveFold !== b.aboveFold) return a.aboveFold ? -1 : 1;
+    return a.y - b.y;
   });
   return items;
 })()`;
@@ -504,6 +531,12 @@ export class DemoAgent {
             `{"action":"wait_for_mutation","url":"","selector_strategy":"","selector_value":"","value":"15","scroll_amount":0,"reasoning":"Wait for ${profile.demo_wow_moment}"}`,
             `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":700,"reasoning":"Scroll to reveal the full generated output"}`,
           ]
+        : profile.hero_button_text
+        ? [
+            `{"action":"click","url":"","selector_strategy":"button_text","selector_value":"${profile.hero_button_text}","value":"","scroll_amount":0,"reasoning":"Click ${profile.hero_button_text} to trigger ${profile.core_action}"}`,
+            `{"action":"wait_for_mutation","url":"","selector_strategy":"","selector_value":"","value":"10","scroll_amount":0,"reasoning":"Wait for ${profile.demo_wow_moment}"}`,
+            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":600,"reasoning":"Scroll to show the result"}`,
+          ]
         : [
             `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":600,"reasoning":"Reveal core features of ${profile.product_name}"}`,
             `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":1000,"reasoning":"Show more ${profile.product_name} capabilities"}`,
@@ -520,15 +553,25 @@ export class DemoAgent {
     const template = `[\n${[...act1, ...act2, ...act3].join(",\n")}\n]`;
 
     const prompt = [
-      `You are scripting a 60-second cinematic demo for "${profile.product_name}" (${profile.product_category}).`,
+      `You are a demo Director scripting a 60-second cinematic demo for "${profile.product_name}" (${profile.product_category}).`,
       `Core capability: ${profile.core_action}`,
       `Wow moment: ${profile.demo_wow_moment}`,
       "",
       "Available pages (sorted best-first):",
       pageList,
       "",
-      "Improve the reasoning fields in this template to be product-specific and compelling.",
-      "You MAY add ONE action=click for a visible interactive tab or accordion — nowhere else.",
+      "=== ACTION RANKING (STRICT) ===",
+      "1. type   — most impressive; use whenever there is a text input",
+      "2. click  — second-best; use for primary CTAs, feature tabs, demo buttons",
+      "3. scroll — TRANSITION ONLY; never as the primary demo step",
+      "",
+      "=== ZERO-SCROLL MANDATE ===",
+      "A plan with only navigate + scroll steps is a FAILURE. Every plan MUST contain at least one type or click",
+      "step that interacts with a real product feature. If the template lacks interaction, ADD a click step",
+      "targeting a visible button name from the discovered elements.",
+      "",
+      "Improve the reasoning fields in the template to be product-specific.",
+      "You MAY add additional click steps if they trigger product features (tabs, demo buttons, accordions).",
       "Do NOT change url, selector_value, or value fields. Do NOT add Login/Auth/Form steps.",
       "Return ONLY the completed JSON array, no markdown:",
       template,
@@ -577,35 +620,55 @@ export class DemoAgent {
     );
     const heroInput = inputs[0];
 
-    if (heroInput) {
+    // Use profile data first, then discovered DOM, then last-resort heuristics
+    const heroPlaceholder = profile?.hero_input_placeholder || heroInput?.placeholder || heroInput?.name;
+    const heroButton = profile?.hero_button_text || mainPage?.interactive_elements?.find(
+      (el) => !el.isInput && el.aboveFold !== false
+    )?.name;
+
+    if (heroPlaceholder) {
+      // Have an input — TYPE first (most impressive demo step)
       steps.push({
         action: "type",
         selector_strategy: "placeholder",
-        selector_value: heroInput.placeholder || heroInput.name || heroInput.aria_label,
-        aria_name: heroInput.placeholder || heroInput.name || heroInput.aria_label,
+        selector_value: heroPlaceholder,
+        aria_name: heroPlaceholder,
         value: demoText,
-        reasoning: `Type a demo prompt into the hero input "${heroInput.name}"`,
+        reasoning: `Type a demo input to trigger ${profile?.core_action ?? "the main feature"}`,
       });
       steps.push({
-        action: "wait",
-        value: "5",
-        reasoning: "Wait for AI generation to complete",
-      });
-      steps.push({
-        action: "scroll",
-        value: "800",
-        reasoning: "Scroll to reveal the generated output",
+        action: "wait_for_mutation",
+        value: "15",
+        reasoning: `Wait for ${profile?.demo_wow_moment ?? "output to appear"}`,
       });
       steps.push({
         action: "scroll",
-        value: "1600",
-        reasoning: "Continue scrolling to show the full result",
+        scroll_amount: 700,
+        reasoning: "Reveal the generated output",
+      });
+    } else if (heroButton) {
+      // No input but we have a hero CTA — CLICK it (still real interaction)
+      steps.push({
+        action: "scroll",
+        scroll_amount: 300,
+        reasoning: "Reveal the hero section",
+      });
+      steps.push({
+        action: "click",
+        aria_name: heroButton,
+        selector_strategy: "button_text",
+        selector_value: heroButton,
+        reasoning: `Click the primary CTA "${heroButton}" to start the demo`,
+      });
+      steps.push({
+        action: "wait_for_mutation",
+        value: "8",
+        reasoning: "Wait for the interface to respond",
       });
     } else {
-      // No input found — explore the page with scrolls
-      steps.push({ action: "scroll", value: "700",  reasoning: "Explore the landing page" });
-      steps.push({ action: "scroll", value: "1400", reasoning: "Show more features" });
-      steps.push({ action: "scroll", value: "2100", reasoning: "Reveal footer and CTAs" });
+      // Truly nothing actionable — at least scroll meaningfully
+      steps.push({ action: "scroll", scroll_amount: 400, reasoning: `Reveal the ${profile?.product_name ?? "product"} hero section` });
+      steps.push({ action: "scroll", scroll_amount: 800, reasoning: `Showcase ${profile?.core_action ?? "the product features"}` });
     }
 
     const catRank: Record<string, number> = {

@@ -32,6 +32,7 @@ export interface InteractiveElement {
   x: number;
   y: number;
   isInput?: boolean;
+  aboveFold?: boolean;
 }
 
 export type PageCategory = "HERO_FEATURE" | "DASHBOARD" | "EDITOR" | "FORM" | "STATIC" | "AUTH";
