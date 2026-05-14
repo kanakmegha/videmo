@@ -3,7 +3,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import OpenAI from "openai";
 import type { BrowserContext, Page } from "playwright-core";
-import type { PlanStep, PageInfo, PageCategory } from "../types";
+import type { PlanStep, PageInfo, PageCategory, ProductProfile } from "../types";
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -143,7 +143,8 @@ type Emit = (type: string, data: Record<string, unknown>) => void;
 const LOCAL_VIDEO_DIR = join(tmpdir(), "demogen-videos");
 
 export class DemoAgent {
-  private sitemap = new Map<string, PageInfo>();
+  private sitemap     = new Map<string, PageInfo>();
+  private profile: ProductProfile | null = null;
 
   constructor(
     private jobId: string,
@@ -166,8 +167,11 @@ export class DemoAgent {
       await this.emit("phase", { phase: "strategize", message: "Analysing pages with AI…" });
       await this._strategize(page);
 
+      await this.emit("phase", { phase: "plan", message: "Profiling product…" });
+      this.profile = await this._deepAnalyze(page);
+
       await this.emit("phase", { phase: "plan", message: "Building action plan…" });
-      const steps = await this._plan();
+      const steps = await this._plan(this.profile);
       return steps;
     } finally {
       await ctx?.close().catch(() => {});
@@ -359,134 +363,202 @@ export class DemoAgent {
     }
   }
 
+  // ── Deep Analyse ──────────────────────────────────────────────────────────
+  // Visits the homepage, extracts real page content, and asks the LLM to
+  // produce a structured ProductProfile used to drive a site-specific plan.
+
+  private async _deepAnalyze(page: Page): Promise<ProductProfile> {
+    const fallback: ProductProfile = {
+      product_name: new URL(this.url).hostname.replace(/^www\./, ""),
+      product_category: "other",
+      core_action: "explore the product features",
+      hero_input_placeholder: null,
+      hero_button_text: null,
+      hero_nav_link: null,
+      demo_input_value: "Build a modern hotel booking dashboard with dark mode",
+      demo_wow_moment: "new content appears on the page",
+      page_sections: [],
+    };
+
+    try {
+      await page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      await sleep(2000);
+
+      // Extract all text (truncated to keep prompt manageable)
+      const text = await page
+        .evaluate(() => (document.body.innerText ?? "").slice(0, 2500))
+        .catch(() => "");
+
+      // Extract visible inputs with their metadata
+      const inputs = await page.evaluate(() =>
+        Array.from(
+          document.querySelectorAll('input, textarea, [contenteditable="true"]')
+        )
+          .filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          })
+          .map((el) => ({
+            type: (el as HTMLInputElement).type || el.tagName.toLowerCase(),
+            placeholder: (el as HTMLInputElement).placeholder || el.getAttribute("aria-placeholder") || "",
+            label: el.getAttribute("aria-label") || "",
+          }))
+          .filter((el) => el.placeholder || el.label)
+          .slice(0, 10)
+      ).catch(() => [] as { type: string; placeholder: string; label: string }[]);
+
+      // All visible button labels
+      const buttons = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('button, [role="button"]'))
+          .map((el) => (el as HTMLElement).innerText?.trim())
+          .filter(Boolean)
+          .slice(0, 20)
+      ).catch(() => [] as string[]);
+
+      // Nav links (text + href)
+      const navLinks = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("nav a, header a"))
+          .map((el) => ({
+            text: (el as HTMLElement).innerText?.trim(),
+            href: (el as HTMLAnchorElement).href,
+          }))
+          .filter((el) => el.text && el.href && !el.href.includes("#"))
+          .slice(0, 15)
+      ).catch(() => [] as { text: string; href: string }[]);
+
+      const buf = await page.screenshot({ type: "jpeg", quality: 60 }).catch(() => null);
+
+      const prompt =
+        "You are analyzing a web product to plan a cinematic demo video.\n\n" +
+        `Page text content:\n${text}\n\n` +
+        `Buttons found: ${JSON.stringify(buttons)}\n` +
+        `Input fields found: ${JSON.stringify(inputs)}\n` +
+        `Navigation links: ${JSON.stringify(navLinks)}\n\n` +
+        "Answer ONLY with a valid JSON object, no other text:\n" +
+        JSON.stringify({
+          product_name: "exact product name",
+          product_category: "speech_ai | coding_tool | design_tool | data_tool | productivity | ecommerce | other",
+          core_action: "the single most impressive thing this product lets you do in one sentence",
+          hero_input_placeholder: "exact placeholder of the most important input, or null",
+          hero_button_text: "exact text of the primary CTA button, or null",
+          hero_nav_link: "full URL of the most feature-rich page (not homepage), or null",
+          demo_input_value: "a specific impressive input tailored to this product — for speech tools: a sentence to speak; for coding tools: a feature to build; for design tools: a design to create",
+          demo_wow_moment: "one sentence: what visual change happens after the user triggers the core action",
+          page_sections: ["list", "of", "visible", "section", "headings", "on", "homepage"],
+        }, null, 2);
+
+      const reply = await askLLM(prompt, buf?.toString("base64"), !buf);
+      const m = reply.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error("No JSON object in reply");
+      const parsed = JSON.parse(m[0]) as ProductProfile;
+
+      await this.emit("product_profiled", {
+        product_name: parsed.product_name,
+        category: parsed.product_category,
+        core_action: parsed.core_action,
+      });
+      return parsed;
+    } catch {
+      return fallback;
+    }
+  }
+
   // ── Plan ─────────────────────────────────────────────────────────────────
 
-  private async _plan(): Promise<PlanStep[]> {
-    // Prioritise: HERO_FEATURE > EDITOR > DASHBOARD > others, then by score
-    const categoryRank: Record<string, number> = {
-      HERO_FEATURE: 5, EDITOR: 4, DASHBOARD: 3, FORM: 1, STATIC: 0, AUTH: -1,
+  private async _plan(profile: ProductProfile): Promise<PlanStep[]> {
+    const catRank: Record<string, number> = {
+      HERO_FEATURE: 5, EDITOR: 4, DASHBOARD: 3, FORM: 0, STATIC: 0, AUTH: -5,
     };
-    const allPages = [...this.sitemap.values()].sort((a, b) => {
-      const ra = categoryRank[a.category ?? "STATIC"] ?? 0;
-      const rb = categoryRank[b.category ?? "STATIC"] ?? 0;
-      return (rb + (b.demo_value ?? 0)) - (ra + (a.demo_value ?? 0));
-    });
+    const allPages = [...this.sitemap.values()].sort((a, b) =>
+      (catRank[b.category ?? "STATIC"] ?? 0) + (b.demo_value ?? 0) -
+      (catRank[a.category ?? "STATIC"] ?? 0) - (a.demo_value ?? 0)
+    );
 
     const pageList = allPages
-      .map((p) => `  url="${p.url}" category=${p.category ?? "?"} score=${p.demo_value ?? "?"} purpose="${p.purpose || p.title}"`)
+      .map((p) => `  url="${p.url}" cat=${p.category ?? "?"} score=${p.demo_value ?? "?"} "${p.purpose || p.title}"`)
       .join("\n");
 
-    // Find the hero input on any discovered page (prefer HERO_FEATURE pages)
-    const heroPage = allPages.find((p) =>
-      p.interactive_elements?.some(
-        (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
-      )
-    );
-    const heroInputEl = heroPage?.interactive_elements?.find(
-      (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
+    // Resolve act2 URL: prefer profile's hero_nav_link, else highest-scored non-root
+    const act2Url =
+      profile.hero_nav_link && profile.hero_nav_link !== this.url
+        ? profile.hero_nav_link
+        : (allPages.find((p) => p.url !== this.url && (p.demo_value ?? 0) >= 6)?.url ?? this.url);
+
+    const act3Page = allPages.find(
+      (p) => p.url !== this.url && p.url !== act2Url && (p.demo_value ?? 0) >= 4
     );
 
-    // Ask the LLM to generate a specific, impressive demo input for this product
-    let demoInput = "Build a modern hotel booking dashboard with dark mode";
-    if (heroInputEl) {
-      const productContext = allPages
-        .slice(0, 3)
-        .map((p) => p.purpose || p.title)
-        .join("; ");
-      const inputReply = await askLLM(
-        `Product: ${this.url}\nWhat it does: ${productContext}\n\n` +
-        "Write ONE specific, impressive demo prompt a user would type into this product's main input to showcase its best capability.\n" +
-        "Examples: for a coding tool → 'Build a responsive navbar with dark mode toggle'\n" +
-        "For a design tool → 'Create a modern SaaS landing page hero with gradient'\n" +
-        "For a data tool → 'Show monthly revenue breakdown by region for Q4'\n" +
-        "Return ONLY the prompt text, nothing else.",
-        undefined,
-        true
-      );
-      if (inputReply.trim()) demoInput = inputReply.trim().replace(/^["']|["']$/g, "");
-    }
+    // Build template steps with pre-resolved URLs — LLM only fills reasoning
+    const act1 = [
+      `{"action":"navigate","url":"${this.url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Open ${profile.product_name} homepage"}`,
+      `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":350,"reasoning":"Reveal the hero section and ${profile.product_name} tagline"}`,
+    ];
 
-    // ACT 2 hero page: highest-scored page that has the input (or just highest scored)
-    const act2Page = heroPage ?? allPages[0];
-    // ACT 3 depth page: second-best page, different from act2
-    const act3Page = allPages.find((p) => p.url !== act2Page?.url && (p.demo_value ?? 0) >= 5);
+    const act2 = [
+      ...(act2Url !== this.url
+        ? [`{"action":"navigate","url":"${act2Url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Navigate to the primary feature area"}`]
+        : []),
+      ...(profile.hero_input_placeholder
+        ? [
+            `{"action":"type","url":"","selector_strategy":"placeholder","selector_value":"${profile.hero_input_placeholder}","value":"${profile.demo_input_value}","scroll_amount":0,"reasoning":"Trigger ${profile.core_action}"}`,
+            `{"action":"wait_for_mutation","url":"","selector_strategy":"","selector_value":"","value":"15","scroll_amount":0,"reasoning":"Wait for ${profile.demo_wow_moment}"}`,
+            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":700,"reasoning":"Scroll to reveal the full generated output"}`,
+          ]
+        : [
+            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":600,"reasoning":"Reveal core features of ${profile.product_name}"}`,
+            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":1000,"reasoning":"Show more ${profile.product_name} capabilities"}`,
+          ]),
+    ];
+
+    const act3 = act3Page
+      ? [
+          `{"action":"navigate","url":"${act3Page.url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Show ${act3Page.purpose || act3Page.title}"}`,
+          `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":700,"reasoning":"Showcase additional ${profile.product_name} capabilities"}`,
+        ]
+      : [`{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":900,"reasoning":"Continue exploring ${profile.product_name}"}`];
+
+    const template = `[\n${[...act1, ...act2, ...act3].join(",\n")}\n]`;
 
     const prompt = [
-      "You are scripting a 60-second product demo screen-recording with a 3-act structure.",
-      `Product: ${this.url}`,
+      `You are scripting a 60-second cinematic demo for "${profile.product_name}" (${profile.product_category}).`,
+      `Core capability: ${profile.core_action}`,
+      `Wow moment: ${profile.demo_wow_moment}`,
       "",
-      "Discovered pages (sorted best-first — use these URLs exactly):",
+      "Available pages (sorted best-first):",
       pageList,
       "",
-      "=== 3-ACT STRUCTURE ===",
-      "",
-      `ACT 1 — HOOK (0–10s): Land on the homepage. Show the product name/hero. Scroll 350px.`,
-      `  Step 1: action=navigate, url="${this.url}"`,
-      `  Step 2: action=scroll, value="350", reasoning="Reveal the hero section and product tagline"`,
-      "",
-      heroInputEl
-        ? [
-            `ACT 2 — HERO ACTION (10–40s): Navigate to the primary feature page and demonstrate the core capability.`,
-            `  Step 3: action=navigate, url="${act2Page?.url ?? this.url}"`,
-            `  Step 4: action=type, aria_name="${heroInputEl.placeholder || heroInputEl.name}", value="${demoInput}"`,
-            `  Step 5: action=wait, value="6", reasoning="Wait for AI/generation output"`,
-            `  Step 6: action=scroll, value="700", reasoning="Scroll to reveal the generated output"`,
-          ].join("\n")
-        : [
-            `ACT 2 — HERO ACTION (10–40s): Navigate to the highest-value page and scroll through core features.`,
-            `  Step 3: action=navigate, url="${act2Page?.url ?? this.url}"`,
-            `  Step 4: action=scroll, value="600", reasoning="Reveal core feature section"`,
-            `  Step 5: action=scroll, value="1200", reasoning="Show more product capabilities"`,
-          ].join("\n"),
-      "",
-      act3Page
-        ? [
-            `ACT 3 — DEPTH (40–60s): Visit a second feature area to show product breadth.`,
-            `  Step 7: action=navigate, url="${act3Page.url}"`,
-            `  Step 8: action=scroll, value="800", reasoning="Showcase ${act3Page.purpose || act3Page.title}"`,
-          ].join("\n")
-        : `ACT 3 — DEPTH: action=scroll, value="1600", reasoning="Continue exploring the product"`,
-      "",
-      "=== STRICT RULES ===",
-      "- action must be exactly: navigate, click, type, scroll, or wait",
-      "- Use the 3-act steps above as your template; adjust only the reasoning text",
-      "- NEVER add Login, Sign up, Request a demo, Contact sales, or any AUTH/FORM page",
-      "- NEVER use action=click for navigation; use action=navigate with the full URL",
-      "- Only add action=click if there is a visible interactive tab, accordion, or 'Try it' button",
-      "- 6–9 steps total",
-      "",
-      "OUTPUT: one raw JSON array, no markdown:",
-      '[{"action":"navigate","url":"","aria_name":"","value":"","reasoning":""}]',
+      "Improve the reasoning fields in this template to be product-specific and compelling.",
+      "You MAY add ONE action=click for a visible interactive tab or accordion — nowhere else.",
+      "Do NOT change url, selector_value, or value fields. Do NOT add Login/Auth/Form steps.",
+      "Return ONLY the completed JSON array, no markdown:",
+      template,
     ].join("\n");
 
     try {
       const reply = await askLLM(prompt, undefined, true);
       if (!reply) throw new Error("Empty LLM response");
       const m = reply.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error(`No JSON array found. LLM said: ${reply.slice(0, 200)}`);
+      if (!m) throw new Error("No JSON array in reply");
       const raw = JSON.parse(m[0]) as PlanStep[];
       if (!Array.isArray(raw) || raw.length === 0) throw new Error("Empty plan");
       const steps = raw.map((s) => ({
         ...s,
         action: (s.action ?? "scroll").split(/[|\s]/)[0].toLowerCase().trim() as PlanStep["action"],
       }));
-      await this.emit("plan_llm", { used: true, steps: steps.length });
+      await this.emit("plan_llm", { used: true, steps: steps.length, product: profile.product_name });
       return steps;
     } catch (e) {
-      await this.emit("plan_fallback", {
-        used: true,
-        error: String(e),
-        message: "LLM planning failed — using smart element-based fallback",
-      });
-      return this._buildSmartFallback();
+      await this.emit("plan_fallback", { used: true, error: String(e), message: "Using smart fallback" });
+      return this._buildSmartFallback(profile);
     }
   }
 
   // ── Smart fallback: builds a real plan from discovered element data ────────
 
-  private _buildSmartFallback(): PlanStep[] {
+  private _buildSmartFallback(profile?: ProductProfile): PlanStep[] {
     const steps: PlanStep[] = [];
     const mainPage = this.sitemap.get(this.url);
+    const demoText = profile?.demo_input_value ?? "Build a modern hotel booking dashboard with dark mode";
 
     steps.push({
       action: "navigate",
@@ -508,8 +580,10 @@ export class DemoAgent {
     if (heroInput) {
       steps.push({
         action: "type",
+        selector_strategy: "placeholder",
+        selector_value: heroInput.placeholder || heroInput.name || heroInput.aria_label,
         aria_name: heroInput.placeholder || heroInput.name || heroInput.aria_label,
-        value: "Build a modern hotel booking dashboard with dark theme",
+        value: demoText,
         reasoning: `Type a demo prompt into the hero input "${heroInput.name}"`,
       });
       steps.push({
@@ -691,19 +765,28 @@ export class DemoAgent {
         }
 
         case "type": {
-          const name = step.aria_name ?? "";
+          // Prefer selector_value (from deep-analyse) over aria_name (legacy)
+          const name = step.selector_value || step.aria_name || "";
+          const strategy = step.selector_strategy ?? "placeholder";
           const defaultText = step.value || "Build a modern hotel booking dashboard with dark theme";
           const nameIsUsable = name.trim().split(/\s+/).length <= 4;
 
           const tryType = async (text: string): Promise<boolean> => {
+            const nameRe = nameIsUsable && name ? new RegExp(escapeRe(name), "i") : null;
             const selectors = [
-              ...(nameIsUsable && name
-                ? [
-                    page.getByPlaceholder(new RegExp(escapeRe(name), "i")).first(),
-                    page.getByLabel(new RegExp(escapeRe(name), "i")).first(),
-                    page.locator(`[aria-placeholder*="${name}" i]`).first(),
-                    page.locator(`[placeholder*="${name}" i]`).first(),
-                  ]
+              // Strategy-aware primary selectors
+              ...(nameRe && strategy === "placeholder"
+                ? [page.getByPlaceholder(nameRe).first(), page.locator(`[placeholder*="${name}" i]`).first()]
+                : []),
+              ...(nameRe && strategy === "aria_label"
+                ? [page.getByLabel(nameRe).first()]
+                : []),
+              ...(nameRe && strategy === "text"
+                ? [page.getByText(name, { exact: false }).first()]
+                : []),
+              // Generic fallbacks
+              ...(nameRe && strategy === "placeholder"
+                ? [page.locator(`[aria-placeholder*="${name}" i]`).first()]
                 : []),
               page.locator("textarea:visible").first(),
               page.getByRole("textbox").first(),
@@ -782,7 +865,7 @@ export class DemoAgent {
         }
 
         case "scroll": {
-          const amount = parseInt(step.value ?? "700", 10) || 700;
+          const amount = step.scroll_amount ?? (parseInt(step.value ?? "700", 10) || 700);
           await this._smoothScroll(page, amount);
           break;
         }
@@ -790,6 +873,12 @@ export class DemoAgent {
         case "wait": {
           const ms = Math.min(parseInt(step.value ?? "3", 10) * 1000, 10_000);
           await sleep(ms);
+          break;
+        }
+
+        case "wait_for_mutation": {
+          const maxMs = Math.min(parseInt(step.value ?? "15", 10) * 1000, 15_000);
+          await this._waitForDOMChange(page, maxMs);
           break;
         }
       }

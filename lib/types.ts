@@ -1,11 +1,26 @@
-export type ActionType = "navigate" | "click" | "type" | "scroll" | "wait";
+export type ActionType = "navigate" | "click" | "type" | "scroll" | "wait" | "wait_for_mutation";
 
 export interface PlanStep {
   action: ActionType;
   url?: string;
   aria_name?: string;
+  selector_strategy?: "placeholder" | "button_text" | "aria_label" | "css" | "text";
+  selector_value?: string;
   value?: string;
+  scroll_amount?: number;
   reasoning: string;
+}
+
+export interface ProductProfile {
+  product_name: string;
+  product_category: "speech_ai" | "coding_tool" | "design_tool" | "data_tool" | "productivity" | "ecommerce" | "other";
+  core_action: string;
+  hero_input_placeholder: string | null;
+  hero_button_text: string | null;
+  hero_nav_link: string | null;
+  demo_input_value: string;
+  demo_wow_moment: string;
+  page_sections: string[];
 }
 
 export interface InteractiveElement {
