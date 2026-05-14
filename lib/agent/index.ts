@@ -349,29 +349,20 @@ export class DemoAgent {
   // ── Plan ─────────────────────────────────────────────────────────────────
 
   private async _plan(): Promise<PlanStep[]> {
-    // Sort pages: product/feature/ai/template pages first, then by demo_value
-    const allPages = [...this.sitemap.values()].sort((a, b) => {
-      const featureScore = (p: PageInfo) =>
-        /product|features?|ai|templates?|pricing|showcase|demo|tour/i.test(p.url) ? 10 : 0;
-      return (
-        featureScore(b) + (b.demo_value ?? 0) - (featureScore(a) + (a.demo_value ?? 0))
-      );
-    });
+    const allPages = [...this.sitemap.values()].sort(
+      (a, b) => (b.demo_value ?? 0) - (a.demo_value ?? 0)
+    );
 
     const pageList = allPages
-      .map((p) => `  - ${p.url} | "${p.purpose || p.title}" | demo_value=${p.demo_value ?? "?"}/10`)
+      .map((p) => `  url="${p.url}" purpose="${p.purpose || p.title}" demo_value=${p.demo_value ?? "?"}/10`)
       .join("\n");
 
     const startInfo = this.sitemap.get(this.url);
     const startElements = (startInfo?.interactive_elements ?? []).slice(0, 25);
 
-    // Detect hero input for AI tools (textarea/textbox on landing page)
     const heroInputEl = startElements.find(
       (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
     );
-
-    // Best 2 feature pages (not the root URL)
-    const featurePages = allPages.filter((p) => p.url !== this.url).slice(0, 2);
 
     const elementNames = startElements
       .map((e) => e.placeholder || e.name)
@@ -379,48 +370,35 @@ export class DemoAgent {
       .slice(0, 15);
 
     const prompt = [
-      "You are making a 60-second PRODUCT DEMO screen-recording for a potential customer.",
-      "Your goal: show the product WORKING and delivering value — not marketing copy.",
+      "You are creating a 60-second screen-recording demo for a potential customer of this product.",
+      "Goal: show the product's CORE FEATURES working — what the product actually does, not marketing text.",
       "",
-      `Product URL: ${this.url}`,
-      `Discovered pages (sorted by demo value):`,
+      `Site: ${this.url}`,
+      "",
+      "Pages discovered (use these URLs exactly — pick the ones that show the product in action):",
       pageList,
       "",
       heroInputEl
-        ? `Hero input found on landing page: placeholder="${heroInputEl.placeholder || heroInputEl.name}" (use this exact string as aria_name for the type step)`
-        : "No text input on landing page — do NOT add a type step.",
+        ? `The landing page has a text input: aria_name="${heroInputEl.placeholder || heroInputEl.name}" — use this to demonstrate the product's main AI/search/create feature.`
+        : "The landing page has NO text input — do NOT add a type step.",
       "",
-      `Landing page clickable elements: ${JSON.stringify(elementNames)}`,
-      `Best feature pages to visit: ${featurePages.map((p) => p.url).join(", ") || "none beyond root"}`,
+      `Clickable elements on landing page: ${JSON.stringify(elementNames)}`,
       "",
-      "=== DEMO SCRIPT RULES ===",
-      `Step 1: action=navigate, url="${this.url}" — always start here.`,
+      "RULES:",
+      "1. action must be exactly one of: navigate, click, type, scroll, wait",
+      "2. Always start with action=navigate to the root URL.",
       heroInputEl
-        ? `Step 2: action=type, aria_name="${heroInputEl.placeholder || heroInputEl.name}", value="Build a modern hotel booking dashboard with dark theme" — use the hero input.`
-        : `Step 2: action=scroll, value="700" — scroll to reveal the hero product screenshots.`,
-      heroInputEl
-        ? "Step 3: action=wait, value=\"6\" — wait for AI output."
-        : `Step 3: action=scroll, value="1400" — continue scrolling to show core features.`,
-      featurePages[0]
-        ? `Step 4: action=navigate, url="${featurePages[0].url}" — go to the best feature page.`
-        : "Step 4: action=scroll, value=\"2100\" — scroll deeper to show more features.",
-      "Step 5: action=scroll, value=\"800\" — scroll through that page's feature sections.",
-      featurePages[1]
-        ? `Step 6 (optional): action=navigate, url="${featurePages[1].url}" — show a second feature area.`
-        : "Step 6 (optional): action=scroll, value=\"1600\" — continue revealing features.",
-      "Step 7 (optional): action=scroll, value=\"800\" — final scroll to show more.",
+        ? `3. Use action=type with aria_name="${heroInputEl.placeholder || heroInputEl.name}" to demonstrate the main feature.`
+        : "3. Use action=scroll (value 600–900) to reveal product screenshots and feature sections on each page.",
+      "4. Use action=navigate (with url from the discovered list) to visit pages that SHOW the product — prefer pages whose purpose mentions features, demos, templates, pricing, or AI.",
+      "5. NEVER use action=click to navigate — use action=navigate with the full url instead.",
+      "6. Only use action=click for interactive elements like 'Watch demo', 'See it in action', 'Try it', etc.",
+      "7. NEVER click Login, Sign up, Home, or generic nav links.",
+      "8. 5–7 steps. Each step's reasoning must name the specific product feature being showcased.",
+      "9. aria_name must be the EXACT string from the element list above — never a description.",
       "",
-      "=== STRICT RULES ===",
-      "- action must be EXACTLY one of: navigate, click, type, scroll, wait",
-      "- NEVER click Home, Login, Sign up, or general nav links — these hide features not show them",
-      "- NEVER click a link just to navigate when you can use action=navigate with the url directly",
-      "- Only use action=click if there is a 'See how it works', 'Watch demo', or interactive feature button",
-      "- aria_name must be the EXACT string from the element list above, not a description",
-      "- 5–7 steps total",
-      "- reasoning must explain WHAT PRODUCT FEATURE this step demonstrates",
-      "",
-      "OUTPUT: one raw JSON array, no markdown, no explanation:",
-      '[{"action":"navigate","url":"...","aria_name":"","value":"","reasoning":"..."}]',
+      "OUTPUT: raw JSON array only, no markdown:",
+      '[{"action":"navigate","url":"","aria_name":"","value":"","reasoning":""}]',
     ].join("\n");
 
     try {
@@ -498,14 +476,9 @@ export class DemoAgent {
       steps.push({ action: "scroll", value: "2100", reasoning: "Reveal footer and CTAs" });
     }
 
-    // Prefer product/feature pages over generic pages
     const priorityPage = [...this.sitemap.values()]
       .filter((p) => p.url !== this.url)
-      .sort((a, b) => {
-        const featureScore = (p: PageInfo) =>
-          /product|features?|ai|templates?|showcase|demo|tour/i.test(p.url) ? 10 : 0;
-        return featureScore(b) + (b.demo_value ?? 0) - (featureScore(a) - (a.demo_value ?? 0));
-      })[0];
+      .sort((a, b) => (b.demo_value ?? 0) - (a.demo_value ?? 0))[0];
 
     if (priorityPage) {
       steps.push({
