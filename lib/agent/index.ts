@@ -314,11 +314,18 @@ export class DemoAgent {
 
         const reply = await askLLM(
           `Webpage: ${url}\nTitle: ${info.title}\n\n` +
-            "1. One-sentence purpose?\n" +
-            "2. Demo Value 1-10 (AI tool/interactive=10, legal/error=1)?\n" +
+            "Score this page's value for a PRODUCT DEMO VIDEO that shows the product working.\n\n" +
+            "SCORING GUIDE:\n" +
+            "9-10 = Core product feature shown in action (editor, AI, database, builder, playground)\n" +
+            "7-8  = Feature overview with product screenshots or animations\n" +
+            "5-6  = General marketing/pricing/landing page\n" +
+            "2-4  = Enterprise/sales inquiry/contact/partner/press page\n" +
+            "0-1  = Sign-up form, login page, legal, error page, or any page that requires form submission\n\n" +
+            "1. One-sentence purpose of this page?\n" +
+            "2. Demo value score using the guide above?\n" +
             "Format EXACTLY: Purpose: [text] | Value: [number]",
           b64,
-          false // use vision model
+          false
         );
 
         const m = reply.match(/Purpose:\s*(.+?)\s*\|\s*Value:\s*(\d+)/i);
@@ -327,7 +334,8 @@ export class DemoAgent {
             (el) => el.isInput || el.placeholder || el.role === "textbox"
           );
           info.purpose = m[1].trim();
-          info.demo_value = Math.min(10, parseInt(m[2], 10) + (hasInput ? 2 : 0));
+          const rawScore = parseInt(m[2], 10);
+          info.demo_value = Math.min(10, rawScore + (hasInput ? 1 : 0));
           await this.emit("page_scored", {
             url,
             purpose: info.purpose,
@@ -390,10 +398,10 @@ export class DemoAgent {
       heroInputEl
         ? `3. Use action=type with aria_name="${heroInputEl.placeholder || heroInputEl.name}" to demonstrate the main feature.`
         : "3. Use action=scroll (value 600–900) to reveal product screenshots and feature sections on each page.",
-      "4. Use action=navigate (with url from the discovered list) to visit pages that SHOW the product — prefer pages whose purpose mentions features, demos, templates, pricing, or AI.",
+      "4. Use action=navigate (with url from the discovered list) to visit pages that SHOW the product — prefer pages with demo_value 7 or higher.",
       "5. NEVER use action=click to navigate — use action=navigate with the full url instead.",
-      "6. Only use action=click for interactive elements like 'Watch demo', 'See it in action', 'Try it', etc.",
-      "7. NEVER click Login, Sign up, Home, or generic nav links.",
+      "6. Only use action=click for interactive UI elements like tabs, accordions, 'Watch demo', 'See it in action', 'Try it'.",
+      "7. NEVER click or navigate to: Login, Sign up, Home, Request a demo, Contact sales, Get a quote, Enterprise inquiry, or any page with demo_value below 5.",
       "8. 5–7 steps. Each step's reasoning must name the specific product feature being showcased.",
       "9. aria_name must be the EXACT string from the element list above — never a description.",
       "",
