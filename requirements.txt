@@ -1,9 +1,0 @@
-beautifulsoup4
-requests
-moviepy
-imageio[ffmpeg]
-python-dotenv
-huggingface_hub
-playwright
-pillow
-openai
