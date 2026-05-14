@@ -555,20 +555,42 @@ export class DemoAgent {
 
         case "click": {
           if (!step.aria_name) return false;
-          const re = new RegExp(escapeRe(step.aria_name), "i");
-          const loc = page.getByRole("button", { name: re }).first();
-          if (!(await loc.count())) {
-            const fallback = page.getByText(step.aria_name, { exact: false }).first();
-            if (!(await fallback.count())) return false;
-            await fallback.click({ timeout: 5000 });
-          } else {
-            await loc.scrollIntoViewIfNeeded();
-            await loc.hover();
-            await sleep(300);
-            await loc.click({ timeout: 5000 });
+
+          // Strip decorative characters (→, •, «, emoji, etc.) that break matching
+          const cleanName = step.aria_name.replace(/[^\w\s'-]/g, "").trim();
+          const fullRe  = new RegExp(escapeRe(step.aria_name), "i");
+          const cleanRe = new RegExp(escapeRe(cleanName), "i");
+
+          // Try every likely element type — modern sites rarely use plain <button>
+          const candidates = [
+            page.getByRole("button", { name: fullRe }).first(),
+            page.getByRole("link",   { name: fullRe }).first(),
+            page.getByRole("button", { name: cleanRe }).first(),
+            page.getByRole("link",   { name: cleanRe }).first(),
+            page.locator(`a:has-text("${cleanName}")`).first(),
+            page.locator(`button:has-text("${cleanName}")`).first(),
+            page.locator(`[role="button"]:has-text("${cleanName}")`).first(),
+            page.locator(`[role="tab"]:has-text("${cleanName}")`).first(),
+            page.getByText(cleanName, { exact: false }).first(),
+          ];
+
+          let clicked = false;
+          for (const loc of candidates) {
+            try {
+              if ((await loc.count()) && (await loc.isVisible())) {
+                await loc.scrollIntoViewIfNeeded();
+                await loc.hover();
+                await sleep(200);
+                await loc.click({ timeout: 6000 });
+                // Wait for any navigation or animation triggered by the click
+                await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+                await sleep(2000);
+                clicked = true;
+                break;
+              }
+            } catch { continue; }
           }
-          await sleep(1500);
-          break;
+          return clicked;
         }
 
         case "type": {
