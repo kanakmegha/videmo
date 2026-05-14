@@ -19,11 +19,14 @@ export interface InteractiveElement {
   isInput?: boolean;
 }
 
+export type PageCategory = "HERO_FEATURE" | "DASHBOARD" | "EDITOR" | "FORM" | "STATIC" | "AUTH";
+
 export interface PageInfo {
   url: string;
   title: string;
   purpose?: string;
   demo_value?: number;
+  category?: PageCategory;
   element_count?: number;
   interactive_elements?: InteractiveElement[];
 }

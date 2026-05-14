@@ -3,7 +3,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import OpenAI from "openai";
 import type { BrowserContext, Page } from "playwright-core";
-import type { PlanStep, PageInfo } from "../types";
+import type { PlanStep, PageInfo, PageCategory } from "../types";
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -314,39 +314,44 @@ export class DemoAgent {
 
         const reply = await askLLM(
           `Webpage: ${url}\nTitle: ${info.title}\n\n` +
-            "Score this page's value for a PRODUCT DEMO VIDEO that shows the product working.\n\n" +
-            "SCORING GUIDE:\n" +
-            "9-10 = Core product feature shown in action (editor, AI, database, builder, playground)\n" +
-            "7-8  = Feature overview with product screenshots or animations\n" +
-            "5-6  = General marketing/pricing/landing page\n" +
-            "2-4  = Enterprise/sales inquiry/contact/partner/press page\n" +
-            "0-1  = Sign-up form, login page, legal, error page, or any page that requires form submission\n\n" +
-            "1. One-sentence purpose of this page?\n" +
-            "2. Demo value score using the guide above?\n" +
-            "Format EXACTLY: Purpose: [text] | Value: [number]",
+          "Analyse this page for a product demo video using the rubric below.\n\n" +
+          "CATEGORY — pick exactly one:\n" +
+          "  HERO_FEATURE = AI generator, prompt box, interactive builder, live canvas\n" +
+          "  DASHBOARD    = live data, charts, analytics, project/task view\n" +
+          "  EDITOR       = document editor, code editor, design canvas, form builder\n" +
+          "  FORM         = sign-up, contact, enterprise enquiry, request-demo form\n" +
+          "  STATIC       = marketing copy, blog, press, pricing table (no interaction)\n" +
+          "  AUTH         = login, register, password reset\n\n" +
+          "SCORE — start at 5, apply these adjustments:\n" +
+          "  +5 has AI/generative input (text box that triggers AI output)\n" +
+          "  +4 shows real-time output or live preview\n" +
+          "  +4 has interactive editor or canvas\n" +
+          "  +3 has dashboard with live/dynamic data\n" +
+          "  +3 has multi-step workflow\n" +
+          "  -3 purely static/marketing page\n" +
+          "  -5 login, sign-up, form, or auth page\n" +
+          "Clamp final score to 0–10.\n\n" +
+          "1. One-sentence purpose?\n" +
+          "2. Category from list above?\n" +
+          "3. Final score?\n" +
+          "Format EXACTLY: Purpose: [text] | Category: [CATEGORY] | Value: [score]",
           b64,
           false
         );
 
-        const m = reply.match(/Purpose:\s*(.+?)\s*\|\s*Value:\s*(\d+)/i);
+        const m = reply.match(/Purpose:\s*(.+?)\s*\|\s*Category:\s*(\w+)\s*\|\s*Value:\s*(\d+)/i);
         if (m) {
-          const hasInput = info.interactive_elements?.some(
-            (el) => el.isInput || el.placeholder || el.role === "textbox"
-          );
-          info.purpose = m[1].trim();
-          const rawScore = parseInt(m[2], 10);
-          info.demo_value = Math.min(10, rawScore + (hasInput ? 1 : 0));
+          info.purpose  = m[1].trim();
+          info.category = (m[2].trim().toUpperCase() as PageCategory) ?? "STATIC";
+          info.demo_value = Math.min(10, Math.max(0, parseInt(m[3], 10)));
           await this.emit("page_scored", {
             url,
             purpose: info.purpose,
+            category: info.category,
             value: info.demo_value,
           });
         } else {
-          // Even if LLM returns garbage, emit something so the UI has context
-          await this.emit("score_error", {
-            url,
-            error: "LLM did not return expected format",
-          });
+          await this.emit("score_error", { url, error: "LLM did not return expected format" });
         }
       } catch (e) {
         await this.emit("score_error", { url, error: String(e) });
@@ -357,55 +362,100 @@ export class DemoAgent {
   // ── Plan ─────────────────────────────────────────────────────────────────
 
   private async _plan(): Promise<PlanStep[]> {
-    const allPages = [...this.sitemap.values()].sort(
-      (a, b) => (b.demo_value ?? 0) - (a.demo_value ?? 0)
-    );
+    // Prioritise: HERO_FEATURE > EDITOR > DASHBOARD > others, then by score
+    const categoryRank: Record<string, number> = {
+      HERO_FEATURE: 5, EDITOR: 4, DASHBOARD: 3, FORM: 1, STATIC: 0, AUTH: -1,
+    };
+    const allPages = [...this.sitemap.values()].sort((a, b) => {
+      const ra = categoryRank[a.category ?? "STATIC"] ?? 0;
+      const rb = categoryRank[b.category ?? "STATIC"] ?? 0;
+      return (rb + (b.demo_value ?? 0)) - (ra + (a.demo_value ?? 0));
+    });
 
     const pageList = allPages
-      .map((p) => `  url="${p.url}" purpose="${p.purpose || p.title}" demo_value=${p.demo_value ?? "?"}/10`)
+      .map((p) => `  url="${p.url}" category=${p.category ?? "?"} score=${p.demo_value ?? "?"} purpose="${p.purpose || p.title}"`)
       .join("\n");
 
-    const startInfo = this.sitemap.get(this.url);
-    const startElements = (startInfo?.interactive_elements ?? []).slice(0, 25);
-
-    const heroInputEl = startElements.find(
+    // Find the hero input on any discovered page (prefer HERO_FEATURE pages)
+    const heroPage = allPages.find((p) =>
+      p.interactive_elements?.some(
+        (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
+      )
+    );
+    const heroInputEl = heroPage?.interactive_elements?.find(
       (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
     );
 
-    const elementNames = startElements
-      .map((e) => e.placeholder || e.name)
-      .filter(Boolean)
-      .slice(0, 15);
+    // Ask the LLM to generate a specific, impressive demo input for this product
+    let demoInput = "Build a modern hotel booking dashboard with dark mode";
+    if (heroInputEl) {
+      const productContext = allPages
+        .slice(0, 3)
+        .map((p) => p.purpose || p.title)
+        .join("; ");
+      const inputReply = await askLLM(
+        `Product: ${this.url}\nWhat it does: ${productContext}\n\n` +
+        "Write ONE specific, impressive demo prompt a user would type into this product's main input to showcase its best capability.\n" +
+        "Examples: for a coding tool → 'Build a responsive navbar with dark mode toggle'\n" +
+        "For a design tool → 'Create a modern SaaS landing page hero with gradient'\n" +
+        "For a data tool → 'Show monthly revenue breakdown by region for Q4'\n" +
+        "Return ONLY the prompt text, nothing else.",
+        undefined,
+        true
+      );
+      if (inputReply.trim()) demoInput = inputReply.trim().replace(/^["']|["']$/g, "");
+    }
+
+    // ACT 2 hero page: highest-scored page that has the input (or just highest scored)
+    const act2Page = heroPage ?? allPages[0];
+    // ACT 3 depth page: second-best page, different from act2
+    const act3Page = allPages.find((p) => p.url !== act2Page?.url && (p.demo_value ?? 0) >= 5);
 
     const prompt = [
-      "You are creating a 60-second screen-recording demo for a potential customer of this product.",
-      "Goal: show the product's CORE FEATURES working — what the product actually does, not marketing text.",
+      "You are scripting a 60-second product demo screen-recording with a 3-act structure.",
+      `Product: ${this.url}`,
       "",
-      `Site: ${this.url}`,
-      "",
-      "Pages discovered (use these URLs exactly — pick the ones that show the product in action):",
+      "Discovered pages (sorted best-first — use these URLs exactly):",
       pageList,
       "",
+      "=== 3-ACT STRUCTURE ===",
+      "",
+      `ACT 1 — HOOK (0–10s): Land on the homepage. Show the product name/hero. Scroll 350px.`,
+      `  Step 1: action=navigate, url="${this.url}"`,
+      `  Step 2: action=scroll, value="350", reasoning="Reveal the hero section and product tagline"`,
+      "",
       heroInputEl
-        ? `The landing page has a text input: aria_name="${heroInputEl.placeholder || heroInputEl.name}" — use this to demonstrate the product's main AI/search/create feature.`
-        : "The landing page has NO text input — do NOT add a type step.",
+        ? [
+            `ACT 2 — HERO ACTION (10–40s): Navigate to the primary feature page and demonstrate the core capability.`,
+            `  Step 3: action=navigate, url="${act2Page?.url ?? this.url}"`,
+            `  Step 4: action=type, aria_name="${heroInputEl.placeholder || heroInputEl.name}", value="${demoInput}"`,
+            `  Step 5: action=wait, value="6", reasoning="Wait for AI/generation output"`,
+            `  Step 6: action=scroll, value="700", reasoning="Scroll to reveal the generated output"`,
+          ].join("\n")
+        : [
+            `ACT 2 — HERO ACTION (10–40s): Navigate to the highest-value page and scroll through core features.`,
+            `  Step 3: action=navigate, url="${act2Page?.url ?? this.url}"`,
+            `  Step 4: action=scroll, value="600", reasoning="Reveal core feature section"`,
+            `  Step 5: action=scroll, value="1200", reasoning="Show more product capabilities"`,
+          ].join("\n"),
       "",
-      `Clickable elements on landing page: ${JSON.stringify(elementNames)}`,
+      act3Page
+        ? [
+            `ACT 3 — DEPTH (40–60s): Visit a second feature area to show product breadth.`,
+            `  Step 7: action=navigate, url="${act3Page.url}"`,
+            `  Step 8: action=scroll, value="800", reasoning="Showcase ${act3Page.purpose || act3Page.title}"`,
+          ].join("\n")
+        : `ACT 3 — DEPTH: action=scroll, value="1600", reasoning="Continue exploring the product"`,
       "",
-      "RULES:",
-      "1. action must be exactly one of: navigate, click, type, scroll, wait",
-      "2. Always start with action=navigate to the root URL.",
-      heroInputEl
-        ? `3. Use action=type with aria_name="${heroInputEl.placeholder || heroInputEl.name}" to demonstrate the main feature.`
-        : "3. Use action=scroll (value 600–900) to reveal product screenshots and feature sections on each page.",
-      "4. Use action=navigate (with url from the discovered list) to visit pages that SHOW the product — prefer pages with demo_value 7 or higher.",
-      "5. NEVER use action=click to navigate — use action=navigate with the full url instead.",
-      "6. Only use action=click for interactive UI elements like tabs, accordions, 'Watch demo', 'See it in action', 'Try it'.",
-      "7. NEVER click or navigate to: Login, Sign up, Home, Request a demo, Contact sales, Get a quote, Enterprise inquiry, or any page with demo_value below 5.",
-      "8. 5–7 steps. Each step's reasoning must name the specific product feature being showcased.",
-      "9. aria_name must be the EXACT string from the element list above — never a description.",
+      "=== STRICT RULES ===",
+      "- action must be exactly: navigate, click, type, scroll, or wait",
+      "- Use the 3-act steps above as your template; adjust only the reasoning text",
+      "- NEVER add Login, Sign up, Request a demo, Contact sales, or any AUTH/FORM page",
+      "- NEVER use action=click for navigation; use action=navigate with the full URL",
+      "- Only add action=click if there is a visible interactive tab, accordion, or 'Try it' button",
+      "- 6–9 steps total",
       "",
-      "OUTPUT: raw JSON array only, no markdown:",
+      "OUTPUT: one raw JSON array, no markdown:",
       '[{"action":"navigate","url":"","aria_name":"","value":"","reasoning":""}]',
     ].join("\n");
 
@@ -484,9 +534,15 @@ export class DemoAgent {
       steps.push({ action: "scroll", value: "2100", reasoning: "Reveal footer and CTAs" });
     }
 
+    const catRank: Record<string, number> = {
+      HERO_FEATURE: 5, EDITOR: 4, DASHBOARD: 3, FORM: 0, STATIC: 0, AUTH: -5,
+    };
     const priorityPage = [...this.sitemap.values()]
-      .filter((p) => p.url !== this.url)
-      .sort((a, b) => (b.demo_value ?? 0) - (a.demo_value ?? 0))[0];
+      .filter((p) => p.url !== this.url && (p.demo_value ?? 0) >= 4)
+      .sort((a, b) =>
+        (catRank[b.category ?? "STATIC"] ?? 0) + (b.demo_value ?? 0) -
+        (catRank[a.category ?? "STATIC"] ?? 0) - (a.demo_value ?? 0)
+      )[0];
 
     if (priorityPage) {
       steps.push({
@@ -549,6 +605,39 @@ export class DemoAgent {
       }
     }
     return null;
+  }
+
+  // ── Smooth scroll — increments of 150px with 100ms delays ────────────────
+
+  private async _smoothScroll(page: Page, totalPx: number): Promise<void> {
+    const step = 150;
+    let scrolled = 0;
+    while (scrolled < totalPx) {
+      const chunk = Math.min(step, totalPx - scrolled);
+      await page.mouse.wheel(0, chunk);
+      scrolled += chunk;
+      await sleep(100);
+    }
+    await sleep(600); // brief pause after scroll settles
+  }
+
+  // ── Smart DOM-change wait — polls every 500ms instead of fixed sleep ──────
+
+  private async _waitForDOMChange(page: Page, timeoutMs = 8000): Promise<void> {
+    try {
+      const initial = await page.evaluate(() => document.body.innerHTML.length);
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await sleep(500);
+        const current = await page.evaluate(() => document.body.innerHTML.length);
+        if (current !== initial) {
+          await sleep(1500); // let the new content finish rendering
+          return;
+        }
+      }
+    } catch {
+      await sleep(3000); // fallback if evaluate fails
+    }
   }
 
   // ── Execute action ────────────────────────────────────────────────────────
@@ -630,10 +719,10 @@ export class DemoAgent {
                   await loc.scrollIntoViewIfNeeded();
                   await loc.click();
                   await sleep(300);
-                  await loc.fill(text);
-                  await sleep(400);
+                  await loc.pressSequentially(text, { delay: 40 }); // human-like typing
+                  await sleep(300);
                   await loc.press("Enter");
-                  await sleep(4000);
+                  await this._waitForDOMChange(page, 8000); // smart wait for output
                   return true;
                 }
               } catch { continue; }
@@ -694,8 +783,7 @@ export class DemoAgent {
 
         case "scroll": {
           const amount = parseInt(step.value ?? "700", 10) || 700;
-          await page.mouse.wheel(0, amount);
-          await sleep(1000);
+          await this._smoothScroll(page, amount);
           break;
         }
 
