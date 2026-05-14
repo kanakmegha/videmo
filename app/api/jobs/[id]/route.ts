@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getJob } from "@/lib/redis";
 
-const AGENT_URL = process.env.AGENT_API_URL ?? "http://localhost:8000";
-
-export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const { id } = await params;
-  try {
-    const upstream = await fetch(`${AGENT_URL}/jobs/${id}`);
-    if (!upstream.ok) {
-      return NextResponse.json({ error: "Job not found" }, { status: upstream.status });
-    }
-    const data = await upstream.json();
-    return NextResponse.json(data);
-  } catch {
-    return NextResponse.json({ error: "Agent service unavailable" }, { status: 503 });
-  }
+  const job = await getJob(id);
+  if (!job) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  return NextResponse.json({
+    id: job.id,
+    url: job.url,
+    status: job.status,
+    video_url: job.video_url,
+  });
 }

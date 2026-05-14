@@ -3,12 +3,11 @@
 import { Download, Video } from "lucide-react";
 
 interface Props {
+  videoUrl: string;
   jobId: string;
 }
 
-export default function VideoPlayer({ jobId }: Props) {
-  const videoUrl = `/api/jobs/${jobId}/video`;
-
+export default function VideoPlayer({ videoUrl, jobId }: Props) {
   return (
     <div className="glass rounded-2xl overflow-hidden">
       <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
@@ -19,6 +18,8 @@ export default function VideoPlayer({ jobId }: Props) {
         <a
           href={videoUrl}
           download={`demo-${jobId.slice(0, 8)}.webm`}
+          target="_blank"
+          rel="noopener noreferrer"
           className="btn-secondary text-xs px-3 py-1.5"
         >
           <Download className="w-3.5 h-3.5" />
@@ -26,13 +27,7 @@ export default function VideoPlayer({ jobId }: Props) {
         </a>
       </div>
       <div className="bg-black aspect-video">
-        <video
-          src={videoUrl}
-          controls
-          autoPlay
-          className="w-full h-full"
-          poster=""
-        >
+        <video src={videoUrl} controls autoPlay className="w-full h-full">
           Your browser does not support the video tag.
         </video>
       </div>

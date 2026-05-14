@@ -1,30 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-
-const AGENT_URL = process.env.AGENT_API_URL ?? "http://localhost:8000";
+import { createJob } from "@/lib/redis";
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    let url: string = (body.url ?? "").trim();
+    if (!url) return NextResponse.json({ error: "url is required" }, { status: 400 });
+    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `https://${url}`;
 
-    if (!body.url || typeof body.url !== "string") {
-      return NextResponse.json({ error: "url is required" }, { status: 400 });
-    }
+    const { randomUUID } = await import("crypto");
+    const id = randomUUID();
+    await createJob(id, url);
 
-    const upstream = await fetch(`${AGENT_URL}/jobs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: body.url }),
-    });
-
-    if (!upstream.ok) {
-      const err = await upstream.text();
-      return NextResponse.json({ error: err }, { status: upstream.status });
-    }
-
-    const data = await upstream.json();
-    return NextResponse.json(data, { status: 201 });
+    return NextResponse.json({ job_id: id, url }, { status: 201 });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Agent service unavailable";
-    return NextResponse.json({ error: message }, { status: 503 });
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Failed to create job" },
+      { status: 500 }
+    );
   }
 }

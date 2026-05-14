@@ -8,12 +8,23 @@ export interface PlanStep {
   reasoning: string;
 }
 
+export interface InteractiveElement {
+  id: string;
+  name: string;
+  role: string;
+  aria_label: string;
+  placeholder: string;
+  x: number;
+  y: number;
+}
+
 export interface PageInfo {
   url: string;
   title: string;
   purpose?: string;
   demo_value?: number;
   element_count?: number;
+  interactive_elements?: InteractiveElement[];
 }
 
 export type Phase = "idle" | "discover" | "strategize" | "plan" | "awaiting_approval" | "execute" | "complete" | "error";
@@ -43,5 +54,5 @@ export interface PlanReadyEvent   { steps: PlanStep[] }
 export interface AwaitingApprovalEvent { message: string }
 export interface StepStartEvent   { index: number; total: number; action: string; reasoning: string; aria_name: string; value: string }
 export interface StepCompleteEvent{ index: number; success: boolean }
-export interface CompleteEvent    { video_path: string | null; error?: string }
+export interface CompleteEvent    { video_url: string | null; error?: string }
 export interface ErrorEvent       { message: string }
