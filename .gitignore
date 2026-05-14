@@ -30,6 +30,7 @@ Thumbs.db
 .vercel/
 .idea/
 .vscode/
+.claude/worktrees/
 
 # Next.js
 .next/
