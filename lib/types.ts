@@ -16,6 +16,7 @@ export interface InteractiveElement {
   placeholder: string;
   x: number;
   y: number;
+  isInput?: boolean;
 }
 
 export interface PageInfo {
@@ -56,3 +57,4 @@ export interface StepStartEvent   { index: number; total: number; action: string
 export interface StepCompleteEvent{ index: number; success: boolean }
 export interface CompleteEvent    { video_url: string | null; error?: string }
 export interface ErrorEvent       { message: string }
+export interface InputRequiredEvent { step_index: number; message: string; default_value: string }

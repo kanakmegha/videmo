@@ -47,12 +47,10 @@ async function askLLM(
 
   for (const model of models) {
     try {
-      const resp = await llm.chat.completions.create({
-        model,
-        messages: [{ role: "user", content }],
-        max_tokens: 1200,
-        timeout: 20_000,
-      });
+      const resp = await llm.chat.completions.create(
+        { model, messages: [{ role: "user", content }], max_tokens: 1200 },
+        { timeout: 20_000 }
+      );
       const text = resp.choices[0]?.message.content ?? "";
       if (text.trim()) return text;
     } catch {
@@ -203,7 +201,7 @@ export class DemoAgent {
           aria_name: step.aria_name ?? "",
           value: step.value ?? "",
         });
-        const ok = await this._performAction(page, step);
+        const ok = await this._performAction(page, step, i);
         await this.emit("step_complete", { index: i, success: ok });
         await sleep(1200);
       }
@@ -522,9 +520,35 @@ export class DemoAgent {
     await sleep(3000);
   }
 
+  // ── Wait for user-provided input via Redis ────────────────────────────────
+
+  private async _waitForUserInput(timeoutMs: number): Promise<string | null> {
+    const { popUserInput } = await import("../redis");
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const text = await popUserInput(this.jobId);
+      if (text) return text;
+      await sleep(2000);
+    }
+    return null;
+  }
+
+  // ── Find element coordinates from sitemap (for coordinate-based clicks) ──
+
+  private _findInputCoords(): { x: number; y: number } | null {
+    for (const [, pageInfo] of this.sitemap) {
+      for (const el of pageInfo.interactive_elements ?? []) {
+        if (el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder) {
+          return { x: el.x, y: el.y };
+        }
+      }
+    }
+    return null;
+  }
+
   // ── Execute action ────────────────────────────────────────────────────────
 
-  private async _performAction(page: Page, step: PlanStep): Promise<boolean> {
+  private async _performAction(page: Page, step: PlanStep, stepIndex: number): Promise<boolean> {
     try {
       switch (step.action) {
         case "navigate": {
@@ -551,54 +575,94 @@ export class DemoAgent {
         }
 
         case "type": {
-          // aria_name must be the real placeholder/label from the element list,
-          // not a prose description — we still try it first but fall through broadly
           const name = step.aria_name ?? "";
-          const text = step.value || "Build a modern hotel booking dashboard with dark theme";
-
-          // Short names (<= 4 words) are likely real element labels; longer ones are
-          // prose descriptions the LLM hallucinated — skip the name-based selectors
+          const defaultText = step.value || "Build a modern hotel booking dashboard with dark theme";
           const nameIsUsable = name.trim().split(/\s+/).length <= 4;
 
-          const selectors = [
-            ...(nameIsUsable && name
-              ? [
-                  page.getByPlaceholder(new RegExp(escapeRe(name), "i")).first(),
-                  page.getByLabel(new RegExp(escapeRe(name), "i")).first(),
-                  page.locator(`[aria-placeholder*="${name}" i]`).first(),
-                  page.locator(`[placeholder*="${name}" i]`).first(),
-                ]
-              : []),
-            // Generic fallbacks — largest visible input wins
-            page.locator("textarea:visible").first(),
-            page.getByRole("textbox").first(),
-            page.locator('[contenteditable="true"]:visible').first(),
-            page.locator("input[type=text]:visible").first(),
-            page.locator("input[type=search]:visible").first(),
-            page.locator("input[type=email]:visible").first(),
-            page.locator("input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):visible").first(),
-          ];
+          const tryType = async (text: string): Promise<boolean> => {
+            const selectors = [
+              ...(nameIsUsable && name
+                ? [
+                    page.getByPlaceholder(new RegExp(escapeRe(name), "i")).first(),
+                    page.getByLabel(new RegExp(escapeRe(name), "i")).first(),
+                    page.locator(`[aria-placeholder*="${name}" i]`).first(),
+                    page.locator(`[placeholder*="${name}" i]`).first(),
+                  ]
+                : []),
+              page.locator("textarea:visible").first(),
+              page.getByRole("textbox").first(),
+              page.locator('[contenteditable="true"]:visible').first(),
+              page.locator("input[type=text]:visible").first(),
+              page.locator("input[type=search]:visible").first(),
+              page.locator("input[type=email]:visible").first(),
+              page.locator("input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):visible").first(),
+            ];
+            for (const loc of selectors) {
+              try {
+                if ((await loc.count()) && (await loc.isVisible())) {
+                  await loc.scrollIntoViewIfNeeded();
+                  await loc.click();
+                  await sleep(300);
+                  await loc.fill(text);
+                  await sleep(400);
+                  await loc.press("Enter");
+                  await sleep(4000);
+                  return true;
+                }
+              } catch { continue; }
+            }
+            return false;
+          };
 
-          let typed = false;
-          for (const loc of selectors) {
-            try {
-              if ((await loc.count()) && (await loc.isVisible())) {
-                await loc.scrollIntoViewIfNeeded();
-                await loc.click();
+          let typed = await tryType(defaultText);
+
+          // Coordinate-based fallback — use discovered element positions from planning
+          if (!typed) {
+            const coords = this._findInputCoords();
+            if (coords) {
+              try {
+                await page.mouse.click(coords.x, coords.y);
                 await sleep(300);
-                await loc.fill(text);
-                await sleep(400);
-                await loc.press("Enter");
+                await page.keyboard.type(defaultText, { delay: 25 });
+                await page.keyboard.press("Enter");
                 await sleep(4000);
                 typed = true;
-                break;
-              }
-            } catch {
-              continue;
+              } catch { /* fall through to user prompt */ }
             }
           }
-          if (!typed) return false;
-          break;
+
+          // Ask the user to provide the text — never skip a type step
+          if (!typed) {
+            await this.emit("input_required", {
+              step_index: stepIndex,
+              message: `Could not find the text input automatically. Type your demo text below and click Submit — the agent will use it to continue recording.`,
+              default_value: defaultText,
+            });
+
+            const userText = await this._waitForUserInput(120_000);
+            if (userText) {
+              // One more attempt with user-provided text
+              typed = await tryType(userText);
+              if (!typed) {
+                // Last resort: coordinate click with user text
+                const coords = this._findInputCoords();
+                if (coords) {
+                  try {
+                    await page.mouse.click(coords.x, coords.y);
+                    await sleep(300);
+                    await page.keyboard.type(userText, { delay: 25 });
+                    await page.keyboard.press("Enter");
+                    await sleep(4000);
+                    typed = true;
+                  } catch { /* give up gracefully */ }
+                }
+              }
+            }
+          }
+
+          // Return success even if typing ultimately failed — don't drop the step
+          // from the video; the recording continues regardless
+          return typed;
         }
 
         case "scroll": {

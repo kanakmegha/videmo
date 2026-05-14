@@ -62,3 +62,14 @@ export async function updateJob(
   const updated: Job = { ...existing, ...patch };
   await getRedis().set(`job:${id}`, JSON.stringify(updated), { ex: TTL });
 }
+
+// ── User input (pause/resume during execution) ────────────────────────────────
+
+export async function setUserInput(jobId: string, text: string): Promise<void> {
+  await getRedis().set(`job:${jobId}:user_input`, text, { ex: 300 });
+}
+
+export async function popUserInput(jobId: string): Promise<string | null> {
+  const val = await getRedis().getdel(`job:${jobId}:user_input`);
+  return typeof val === "string" ? val : null;
+}

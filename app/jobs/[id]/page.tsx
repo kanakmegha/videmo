@@ -7,6 +7,7 @@ import type {
   Phase, PlanStep, PageInfo, LogLine,
   PhaseEvent, PageFoundEvent, PageScoredEvent, PlanReadyEvent,
   StepStartEvent, StepCompleteEvent, CompleteEvent, ErrorEvent,
+  InputRequiredEvent,
 } from "@/lib/types";
 import PhaseIndicator from "@/components/phase-indicator";
 import PlanViewer from "@/components/plan-viewer";
@@ -184,6 +185,11 @@ export default function JobPage() {
   const [executing, setExecuting] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
+  // Input-required pause state
+  const [inputPrompt, setInputPrompt] = useState<InputRequiredEvent | null>(null);
+  const [inputValue, setInputValue] = useState("");
+  const [submittingInput, setSubmittingInput] = useState(false);
+
   // Fetch initial job metadata (url, existing video_url if any)
   useEffect(() => {
     fetch(`/api/jobs/${jobId}`)
@@ -231,10 +237,29 @@ export default function JobPage() {
     on<StepCompleteEvent>(es, "step_complete", (d) => dispatch({ type: "STEP_COMPLETE",payload: d }));
     on<CompleteEvent>    (es, "complete",      (d) => { dispatch({ type: "COMPLETE",   payload: d }); es.close(); });
     on<ErrorEvent>       (es, "error",         (d) => { dispatch({ type: "ERROR",      payload: d }); es.close(); setExecuting(false); });
+    on<InputRequiredEvent>(es, "input_required", (d) => {
+      setInputValue(d.default_value);
+      setInputPrompt(d);
+      dispatch({ type: "LOG", entry: { id: Date.now() + "", level: "warn", text: "⌨ Agent needs your input — see prompt above.", ts: Date.now() } });
+    });
 
     es.onerror = () =>
       dispatch({ type: "LOG", entry: { id: Date.now() + "", level: "warn", text: "Connection interrupted — retrying…", ts: Date.now() } });
   }, [jobId]);
+
+  const submitUserInput = useCallback(async () => {
+    if (!inputValue.trim() || !jobId) return;
+    setSubmittingInput(true);
+    await fetch(`/api/jobs/${jobId}/user-input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: inputValue.trim() }),
+    });
+    dispatch({ type: "LOG", entry: { id: Date.now() + "", level: "info", text: `Submitted: "${inputValue.trim()}"`, ts: Date.now() } });
+    setInputPrompt(null);
+    setInputValue("");
+    setSubmittingInput(false);
+  }, [inputValue, jobId]);
 
   const showExecuteButton =
     state.phase === "awaiting_approval" && state.steps.length > 0 && !executing;
@@ -257,6 +282,41 @@ export default function JobPage() {
           <PhaseIndicator phase={state.phase} message={state.phaseMessage} />
         </div>
       </header>
+
+      {/* Input-required overlay */}
+      {inputPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-6 w-full max-w-lg shadow-2xl">
+            <p className="text-sm font-semibold text-amber-400 mb-1">⌨ Agent needs your help</p>
+            <p className="text-sm text-zinc-300 mb-4">{inputPrompt.message}</p>
+            <textarea
+              className="w-full rounded-lg bg-zinc-800 border border-zinc-600 text-zinc-100 text-sm p-3 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500 placeholder:text-zinc-500"
+              rows={3}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitUserInput(); }}
+              placeholder="Type the text the agent should enter…"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2 mt-3">
+              <button
+                className="btn-secondary text-xs px-4 py-2"
+                onClick={() => { setInputPrompt(null); setInputValue(""); }}
+              >
+                Skip
+              </button>
+              <button
+                className="btn-primary text-xs px-4 py-2 disabled:opacity-50"
+                onClick={submitUserInput}
+                disabled={submittingInput || !inputValue.trim()}
+              >
+                {submittingInput ? "Sending…" : "Submit ↵"}
+              </button>
+            </div>
+            <p className="text-xs text-zinc-500 mt-2">Tip: Cmd+Enter to submit quickly</p>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <div className="flex-1 grid lg:grid-cols-[420px_1fr] divide-x divide-zinc-800/50 overflow-hidden">
