@@ -349,49 +349,79 @@ export class DemoAgent {
   // ── Plan ─────────────────────────────────────────────────────────────────
 
   private async _plan(): Promise<PlanStep[]> {
-    const pageList = [...this.sitemap.values()]
-      .map(
-        (p) =>
-          `  - ${p.url}: ${p.purpose || p.title} (demo_value=${p.demo_value ?? "?"}/10)`
-      )
+    // Sort pages: product/feature/ai/template pages first, then by demo_value
+    const allPages = [...this.sitemap.values()].sort((a, b) => {
+      const featureScore = (p: PageInfo) =>
+        /product|features?|ai|templates?|pricing|showcase|demo|tour/i.test(p.url) ? 10 : 0;
+      return (
+        featureScore(b) + (b.demo_value ?? 0) - (featureScore(a) + (a.demo_value ?? 0))
+      );
+    });
+
+    const pageList = allPages
+      .map((p) => `  - ${p.url} | "${p.purpose || p.title}" | demo_value=${p.demo_value ?? "?"}/10`)
       .join("\n");
 
     const startInfo = this.sitemap.get(this.url);
-    const startElements = (startInfo?.interactive_elements ?? []).slice(0, 30);
+    const startElements = (startInfo?.interactive_elements ?? []).slice(0, 25);
 
-    // Detect whether the landing page has a real AI/text input for the type action
-    const hasHeroInput = startElements.some(
-      (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
-    );
+    // Detect hero input for AI tools (textarea/textbox on landing page)
     const heroInputEl = startElements.find(
       (el) => el.isInput || el.role === "textarea" || el.role === "textbox" || el.placeholder
     );
 
-    const typeRule = hasHeroInput
-      ? `2. TYPE into the hero input. Use aria_name="${heroInputEl?.placeholder || heroInputEl?.name || heroInputEl?.aria_label || ""}". ` +
-        `value="Build a modern hotel booking dashboard with dark theme". ` +
-        `Then add a wait step (value:"5").`
-      : `2. Do NOT add a type step — no text input exists on the landing page. ` +
-        `Instead: click the primary CTA button (e.g. "Get started", "Try free", "Sign up") if visible, ` +
-        `then scroll to reveal the product features.`;
+    // Best 2 feature pages (not the root URL)
+    const featurePages = allPages.filter((p) => p.url !== this.url).slice(0, 2);
 
-    const prompt =
-      "You are a Senior Product Demo Director creating a screen-recording demo script.\n\n" +
-      `Target site: ${this.url}\n` +
-      `Discovered pages:\n${pageList}\n\n` +
-      `Landing page interactive elements (ONLY use aria_name values from this list):\n` +
-      JSON.stringify(startElements.map((e) => ({ name: e.name, placeholder: e.placeholder, role: e.role })), null, 2) +
-      "\n\nSCRIPT RULES — follow exactly:\n" +
-      `1. First step: action="navigate", url="${this.url}".\n` +
-      typeRule + "\n" +
-      "3. scroll down (value:\"800\") to reveal above-the-fold features.\n" +
-      "4. Navigate (action=\"navigate\") to the page with the highest demo_value.\n" +
-      "5. scroll that page to showcase its features.\n" +
-      "6. 5–8 steps total.\n" +
-      "CRITICAL: action must be exactly one of: navigate, click, type, scroll, wait — never combined.\n" +
-      "aria_name must be the EXACT name/placeholder string from the element list above, not a description.\n\n" +
-      "OUTPUT: one raw JSON array only, no markdown fences, no explanation:\n" +
-      '[{"action":"navigate","url":"...","aria_name":"","value":"","reasoning":"..."}]';
+    const elementNames = startElements
+      .map((e) => e.placeholder || e.name)
+      .filter(Boolean)
+      .slice(0, 15);
+
+    const prompt = [
+      "You are making a 60-second PRODUCT DEMO screen-recording for a potential customer.",
+      "Your goal: show the product WORKING and delivering value — not marketing copy.",
+      "",
+      `Product URL: ${this.url}`,
+      `Discovered pages (sorted by demo value):`,
+      pageList,
+      "",
+      heroInputEl
+        ? `Hero input found on landing page: placeholder="${heroInputEl.placeholder || heroInputEl.name}" (use this exact string as aria_name for the type step)`
+        : "No text input on landing page — do NOT add a type step.",
+      "",
+      `Landing page clickable elements: ${JSON.stringify(elementNames)}`,
+      `Best feature pages to visit: ${featurePages.map((p) => p.url).join(", ") || "none beyond root"}`,
+      "",
+      "=== DEMO SCRIPT RULES ===",
+      `Step 1: action=navigate, url="${this.url}" — always start here.`,
+      heroInputEl
+        ? `Step 2: action=type, aria_name="${heroInputEl.placeholder || heroInputEl.name}", value="Build a modern hotel booking dashboard with dark theme" — use the hero input.`
+        : `Step 2: action=scroll, value="700" — scroll to reveal the hero product screenshots.`,
+      heroInputEl
+        ? "Step 3: action=wait, value=\"6\" — wait for AI output."
+        : `Step 3: action=scroll, value="1400" — continue scrolling to show core features.`,
+      featurePages[0]
+        ? `Step 4: action=navigate, url="${featurePages[0].url}" — go to the best feature page.`
+        : "Step 4: action=scroll, value=\"2100\" — scroll deeper to show more features.",
+      "Step 5: action=scroll, value=\"800\" — scroll through that page's feature sections.",
+      featurePages[1]
+        ? `Step 6 (optional): action=navigate, url="${featurePages[1].url}" — show a second feature area.`
+        : "Step 6 (optional): action=scroll, value=\"1600\" — continue revealing features.",
+      "Step 7 (optional): action=scroll, value=\"800\" — final scroll to show more.",
+      "",
+      "=== STRICT RULES ===",
+      "- action must be EXACTLY one of: navigate, click, type, scroll, wait",
+      "- NEVER click Home, Login, Sign up, or general nav links — these hide features not show them",
+      "- NEVER click a link just to navigate when you can use action=navigate with the url directly",
+      "- Only use action=click if there is a 'See how it works', 'Watch demo', or interactive feature button",
+      "- aria_name must be the EXACT string from the element list above, not a description",
+      "- 5–7 steps total",
+      "- reasoning must explain WHAT PRODUCT FEATURE this step demonstrates",
+      "",
+      "OUTPUT: one raw JSON array, no markdown, no explanation:",
+      '[{"action":"navigate","url":"...","aria_name":"","value":"","reasoning":"..."}]',
+    ].join("\n");
 
     try {
       const reply = await askLLM(prompt, undefined, true);
@@ -400,7 +430,6 @@ export class DemoAgent {
       if (!m) throw new Error(`No JSON array found. LLM said: ${reply.slice(0, 200)}`);
       const raw = JSON.parse(m[0]) as PlanStep[];
       if (!Array.isArray(raw) || raw.length === 0) throw new Error("Empty plan");
-      // Normalise action names: strip anything after | or space, lowercase
       const steps = raw.map((s) => ({
         ...s,
         action: (s.action ?? "scroll").split(/[|\s]/)[0].toLowerCase().trim() as PlanStep["action"],
@@ -469,19 +498,14 @@ export class DemoAgent {
       steps.push({ action: "scroll", value: "2100", reasoning: "Reveal footer and CTAs" });
     }
 
-    // Navigate to the highest-value secondary page
-    const secondary = [...this.sitemap.values()]
+    // Prefer product/feature pages over generic pages
+    const priorityPage = [...this.sitemap.values()]
       .filter((p) => p.url !== this.url)
-      .sort((a, b) => (b.demo_value ?? 0) - (a.demo_value ?? 0))[0];
-
-    // Prefer pricing or features pages even if not scored
-    const priorityPage =
-      secondary ??
-      [...this.sitemap.values()].find(
-        (p) =>
-          p.url !== this.url &&
-          /pricing|features|enterprise|plans/i.test(p.url)
-      );
+      .sort((a, b) => {
+        const featureScore = (p: PageInfo) =>
+          /product|features?|ai|templates?|showcase|demo|tour/i.test(p.url) ? 10 : 0;
+        return featureScore(b) + (b.demo_value ?? 0) - (featureScore(a) - (a.demo_value ?? 0));
+      })[0];
 
     if (priorityPage) {
       steps.push({
