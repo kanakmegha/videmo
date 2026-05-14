@@ -91,6 +91,9 @@ async function launchContext(
       "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
       "--disable-infobars",
+      "--use-gl=swiftshader",       // software GL — prevents black/blank frames in headless
+      "--enable-webgl",
+      "--hide-scrollbars",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
     userAgent:
@@ -200,9 +203,9 @@ export class DemoAgent {
         await sleep(1200);
       }
 
-      // Finalise: close page so Playwright flushes the video file
-      const videoPath = await page.video()?.path();
+      // Finalise: MUST close page first — Playwright only flushes the video file after close
       await page.close();
+      const videoPath = await page.video()?.path(); // safe to call now
       await ctx.close();
       ctx = null;
 
