@@ -479,10 +479,38 @@ export class DemoAgent {
       if (!m) throw new Error("No JSON object in reply");
       const parsed = JSON.parse(m[0]) as ProductProfile;
 
+      // ── Validate LLM output against actual discovered elements ──
+      // The LLM often hallucinates placeholder/button text — null those out
+      const buttonSet = new Set(buttons.map((b) => b?.toLowerCase().trim()).filter(Boolean));
+      const placeholderSet = new Set(
+        inputs.map((i) => (i.placeholder || i.label).toLowerCase().trim()).filter(Boolean)
+      );
+
+      if (parsed.hero_button_text) {
+        const cleaned = parsed.hero_button_text.toLowerCase().trim();
+        const words = cleaned.split(/\s+/).length;
+        // Must be short (real button text), and must actually exist in the buttons list
+        if (words > 5 || !buttonSet.has(cleaned)) {
+          parsed.hero_button_text = null;
+        }
+      }
+      if (parsed.hero_input_placeholder) {
+        const cleaned = parsed.hero_input_placeholder.toLowerCase().trim();
+        if (!placeholderSet.has(cleaned) && cleaned.split(/\s+/).length > 6) {
+          parsed.hero_input_placeholder = null;
+        }
+      }
+      // Reject generic demo inputs that signal an LLM cop-out
+      if (parsed.demo_input_value && /^(hello world|test|testing|123|abc|sample|example|new content|foo|bar)\b/i.test(parsed.demo_input_value.trim())) {
+        parsed.demo_input_value = fallback.demo_input_value;
+      }
+
       await this.emit("product_profiled", {
         product_name: parsed.product_name,
         category: parsed.product_category,
         core_action: parsed.core_action,
+        hero_input_placeholder: parsed.hero_input_placeholder,
+        hero_button_text: parsed.hero_button_text,
       });
       return parsed;
     } catch {
@@ -493,6 +521,11 @@ export class DemoAgent {
   // ── Plan ─────────────────────────────────────────────────────────────────
 
   private async _plan(profile: ProductProfile): Promise<PlanStep[]> {
+    // ── Build the plan ALGORITHMICALLY from validated profile + discovered DOM ──
+    // The LLM is no longer allowed to author the structure — it hallucinates
+    // placeholder text and removes navigate steps. We build PlanStep objects
+    // directly here, using only data we can verify exists on the page.
+
     const catRank: Record<string, number> = {
       HERO_FEATURE: 5, EDITOR: 4, DASHBOARD: 3, FORM: 0, STATIC: 0, AUTH: -5,
     };
@@ -501,99 +534,128 @@ export class DemoAgent {
       (catRank[a.category ?? "STATIC"] ?? 0) - (a.demo_value ?? 0)
     );
 
-    const pageList = allPages
-      .map((p) => `  url="${p.url}" cat=${p.category ?? "?"} score=${p.demo_value ?? "?"} "${p.purpose || p.title}"`)
-      .join("\n");
+    // Find an actual text input from discovered elements (validated, not LLM-claimed)
+    const realInput = [...this.sitemap.values()]
+      .flatMap((p) => p.interactive_elements ?? [])
+      .find((el) => el.isInput || el.role === "textarea" || el.role === "textbox");
 
-    // Resolve act2 URL: prefer profile's hero_nav_link, else highest-scored non-root
+    // Find a real visible CTA button from discovered elements
+    const realCtaButton = [...this.sitemap.values()]
+      .flatMap((p) => p.interactive_elements ?? [])
+      .find((el) => !el.isInput && el.aboveFold !== false && el.name && el.name.length < 40);
+
+    const inputSelector =
+      profile.hero_input_placeholder ?? realInput?.placeholder ?? realInput?.name ?? null;
+    const buttonSelector =
+      profile.hero_button_text ?? realCtaButton?.name ?? null;
+
     const act2Url =
       profile.hero_nav_link && profile.hero_nav_link !== this.url
         ? profile.hero_nav_link
-        : (allPages.find((p) => p.url !== this.url && (p.demo_value ?? 0) >= 6)?.url ?? this.url);
+        : (allPages.find((p) => p.url !== this.url && (p.demo_value ?? 0) >= 6)?.url ?? null);
 
     const act3Page = allPages.find(
       (p) => p.url !== this.url && p.url !== act2Url && (p.demo_value ?? 0) >= 4
     );
 
-    // Build template steps with pre-resolved URLs — LLM only fills reasoning
-    const act1 = [
-      `{"action":"navigate","url":"${this.url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Open ${profile.product_name} homepage"}`,
-      `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":350,"reasoning":"Reveal the hero section and ${profile.product_name} tagline"}`,
-    ];
+    const productName = profile.product_name || new URL(this.url).hostname;
+    const steps: PlanStep[] = [];
 
-    const act2 = [
-      ...(act2Url !== this.url
-        ? [`{"action":"navigate","url":"${act2Url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Navigate to the primary feature area"}`]
-        : []),
-      ...(profile.hero_input_placeholder
-        ? [
-            `{"action":"type","url":"","selector_strategy":"placeholder","selector_value":"${profile.hero_input_placeholder}","value":"${profile.demo_input_value}","scroll_amount":0,"reasoning":"Trigger ${profile.core_action}"}`,
-            `{"action":"wait_for_mutation","url":"","selector_strategy":"","selector_value":"","value":"15","scroll_amount":0,"reasoning":"Wait for ${profile.demo_wow_moment}"}`,
-            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":700,"reasoning":"Scroll to reveal the full generated output"}`,
-          ]
-        : profile.hero_button_text
-        ? [
-            `{"action":"click","url":"","selector_strategy":"button_text","selector_value":"${profile.hero_button_text}","value":"","scroll_amount":0,"reasoning":"Click ${profile.hero_button_text} to trigger ${profile.core_action}"}`,
-            `{"action":"wait_for_mutation","url":"","selector_strategy":"","selector_value":"","value":"10","scroll_amount":0,"reasoning":"Wait for ${profile.demo_wow_moment}"}`,
-            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":600,"reasoning":"Scroll to show the result"}`,
-          ]
-        : [
-            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":600,"reasoning":"Reveal core features of ${profile.product_name}"}`,
-            `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":1000,"reasoning":"Show more ${profile.product_name} capabilities"}`,
-          ]),
-    ];
+    // ── ACT 1: HOOK (0–10s) ──
+    steps.push({
+      action: "navigate",
+      url: this.url,
+      reasoning: `Open ${productName} homepage`,
+    });
+    steps.push({
+      action: "scroll",
+      scroll_amount: 350,
+      reasoning: `Reveal the ${productName} hero section`,
+    });
 
-    const act3 = act3Page
-      ? [
-          `{"action":"navigate","url":"${act3Page.url}","selector_strategy":"","selector_value":"","value":"","scroll_amount":0,"reasoning":"Show ${act3Page.purpose || act3Page.title}"}`,
-          `{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":700,"reasoning":"Showcase additional ${profile.product_name} capabilities"}`,
-        ]
-      : [`{"action":"scroll","url":"","selector_strategy":"","selector_value":"","value":"","scroll_amount":900,"reasoning":"Continue exploring ${profile.product_name}"}`];
-
-    const template = `[\n${[...act1, ...act2, ...act3].join(",\n")}\n]`;
-
-    const prompt = [
-      `You are a demo Director scripting a 60-second cinematic demo for "${profile.product_name}" (${profile.product_category}).`,
-      `Core capability: ${profile.core_action}`,
-      `Wow moment: ${profile.demo_wow_moment}`,
-      "",
-      "Available pages (sorted best-first):",
-      pageList,
-      "",
-      "=== ACTION RANKING (STRICT) ===",
-      "1. type   — most impressive; use whenever there is a text input",
-      "2. click  — second-best; use for primary CTAs, feature tabs, demo buttons",
-      "3. scroll — TRANSITION ONLY; never as the primary demo step",
-      "",
-      "=== ZERO-SCROLL MANDATE ===",
-      "A plan with only navigate + scroll steps is a FAILURE. Every plan MUST contain at least one type or click",
-      "step that interacts with a real product feature. If the template lacks interaction, ADD a click step",
-      "targeting a visible button name from the discovered elements.",
-      "",
-      "Improve the reasoning fields in the template to be product-specific.",
-      "You MAY add additional click steps if they trigger product features (tabs, demo buttons, accordions).",
-      "Do NOT change url, selector_value, or value fields. Do NOT add Login/Auth/Form steps.",
-      "Return ONLY the completed JSON array, no markdown:",
-      template,
-    ].join("\n");
-
-    try {
-      const reply = await askLLM(prompt, undefined, true);
-      if (!reply) throw new Error("Empty LLM response");
-      const m = reply.match(/\[[\s\S]*\]/);
-      if (!m) throw new Error("No JSON array in reply");
-      const raw = JSON.parse(m[0]) as PlanStep[];
-      if (!Array.isArray(raw) || raw.length === 0) throw new Error("Empty plan");
-      const steps = raw.map((s) => ({
-        ...s,
-        action: (s.action ?? "scroll").split(/[|\s]/)[0].toLowerCase().trim() as PlanStep["action"],
-      }));
-      await this.emit("plan_llm", { used: true, steps: steps.length, product: profile.product_name });
-      return steps;
-    } catch (e) {
-      await this.emit("plan_fallback", { used: true, error: String(e), message: "Using smart fallback" });
-      return this._buildSmartFallback(profile);
+    // ── ACT 2: HERO ACTION (10–40s) — guaranteed real interaction ──
+    if (act2Url) {
+      steps.push({
+        action: "navigate",
+        url: act2Url,
+        reasoning: `Navigate to the primary feature area`,
+      });
     }
+
+    if (inputSelector) {
+      steps.push({
+        action: "type",
+        selector_strategy: "placeholder",
+        selector_value: inputSelector,
+        aria_name: inputSelector,
+        value: profile.demo_input_value,
+        reasoning: `Type a demo input to trigger ${profile.core_action}`,
+      });
+      steps.push({
+        action: "wait_for_mutation",
+        value: "15",
+        reasoning: `Wait for ${profile.demo_wow_moment}`,
+      });
+      steps.push({
+        action: "scroll",
+        scroll_amount: 600,
+        reasoning: "Reveal the generated output",
+      });
+    } else if (buttonSelector) {
+      steps.push({
+        action: "click",
+        selector_strategy: "button_text",
+        selector_value: buttonSelector,
+        aria_name: buttonSelector,
+        reasoning: `Click "${buttonSelector}" to trigger ${profile.core_action}`,
+      });
+      steps.push({
+        action: "wait_for_mutation",
+        value: "10",
+        reasoning: `Wait for ${profile.demo_wow_moment}`,
+      });
+      steps.push({
+        action: "scroll",
+        scroll_amount: 600,
+        reasoning: "Show what the interaction revealed",
+      });
+    } else {
+      // Last resort — couldn't find any actionable element
+      steps.push({
+        action: "scroll",
+        scroll_amount: 800,
+        reasoning: `Showcase ${profile.core_action}`,
+      });
+    }
+
+    // ── ACT 3: DEPTH (40–60s) ──
+    if (act3Page) {
+      steps.push({
+        action: "navigate",
+        url: act3Page.url,
+        reasoning: `Show ${act3Page.purpose || act3Page.title}`,
+      });
+      steps.push({
+        action: "scroll",
+        scroll_amount: 700,
+        reasoning: `Showcase additional ${productName} capabilities`,
+      });
+    } else {
+      steps.push({
+        action: "scroll",
+        scroll_amount: 800,
+        reasoning: `Continue exploring ${productName}`,
+      });
+    }
+
+    await this.emit("plan_built", {
+      product: productName,
+      steps: steps.length,
+      has_input: !!inputSelector,
+      has_button: !!buttonSelector,
+      has_secondary_page: !!act3Page,
+    });
+    return steps;
   }
 
   // ── Smart fallback: builds a real plan from discovered element data ────────
